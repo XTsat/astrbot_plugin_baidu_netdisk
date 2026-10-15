@@ -1065,10 +1065,10 @@ def _get_local_file_size(file_name: str) -> int:
 
 @register(
     "astrbot_plugin_baidu_pan",
-    "linker9527",
+    "XTsat",
     "百度网盘分享文件自动下载发送",
-    "1.8.3",
-    "https://github.com/linker9527/astrbot_plugin_baidu_pan",
+    "2.0.0",
+    "https://github.com/XTsat/astrbot_plugin_baidu_netdisk",
 )
 class BaiduPanPlugin(Star):
 
