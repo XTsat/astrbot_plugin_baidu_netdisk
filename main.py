@@ -428,7 +428,7 @@ def login_bduss_bpcs(bduss: str, stoken: str = "") -> dict:
     text = (out or "") + chr(10) + (err or "")
     if code == 0 and "失败" not in text and "错误" not in text:
         _bpcs_inited = True
-        logger.info("[BaiduPan] BaiduPCS-Go logged in via /pan bduss")
+        logger.info("[BaiduPan] BaiduPCS-Go logged in via /pan login 3/bduss")
         return {"success": True}
     m = re.search(r"错误代码:\s*\d+[^\n]{0,60}|[\u4e00-\u9fa5]{2,20}[:：]?\s*[^\n]{0,60}", text)
     if m:
@@ -506,7 +506,7 @@ def login_bpcs(username: str, password: str) -> dict:
         text = (out_bytes or b"").decode("utf-8", errors="replace")
         if proc.returncode == 0 and "失败" not in text and "错误" not in text:
             _bpcs_inited = True
-            logger.info("[BaiduPan] BaiduPCS-Go logged in via /pan login (stdin)")
+            logger.info("[BaiduPan] BaiduPCS-Go logged in via /pan login 2/pwd (stdin)")
             return {"success": True, "output": text.strip()[:300]}
         logger.info(f"[BaiduPan] stdin login 未成功，回退参数方式: rc={proc.returncode}")
     except Exception as e:
@@ -519,7 +519,7 @@ def login_bpcs(username: str, password: str) -> dict:
     text = (out or "") + chr(10) + (err or "")
     if code == 0 and "失败" not in text and "错误" not in text:
         _bpcs_inited = True
-        logger.info("[BaiduPan] BaiduPCS-Go logged in via /pan login")
+        logger.info("[BaiduPan] BaiduPCS-Go logged in via /pan login 2/pwd")
         return {"success": True, "output": text.strip()[:300]}
     m = re.search(r"[\u4e00-\u9fa5]{2,20}[:：]?\s*[0-9a-zA-Z\u4e00-\u9fa5 ,.()]+", text)
     if m:
@@ -536,7 +536,7 @@ def logout_bpcs() -> dict:
     text = (out or "") + chr(10) + (err or "")
     if code == 0:
         _bpcs_inited = False
-        logger.info("[BaiduPan] BaiduPCS-Go logged out via /pan unlogin")
+        logger.info("[BaiduPan] BaiduPCS-Go logged out via /pan login out")
         return {"success": True}
     return {"error": f"退出失败（退出码 {code}）: {text.strip()[:200]}"}
 
@@ -630,7 +630,7 @@ def _resolve_share_via_page(sess, surl: str, share_link: str) -> dict:
             logger.warning(f"[BaiduPan] 分享页请求失败，重试: {e}")
             time.sleep(1)
     if _grab_share_field(r.text, "loginstate") == "0":
-        return {"error": "网盘未登录，请使用 /pan qrlogin 重新登录"}
+        return {"error": "网盘未登录，请使用 /pan login 1 重新登录"}
     info = {
         "shareid": _grab_share_field(r.text, "shareid"),
         "share_uk": _grab_share_field(r.text, "share_uk") or _grab_share_field(r.text, "uk"),
@@ -761,7 +761,7 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str, fs_ids: list = None
     """
     sess = _build_pan_session()
     if sess is None:
-        return {"error": "无法获取百度网盘登录凭证，请先使用 /pan qrlogin 登录"}
+        return {"error": "无法获取百度网盘登录凭证，请先使用 /pan login 1 登录"}
 
     share_link = f"https://pan.baidu.com/s/{surl}"
 
@@ -1008,7 +1008,7 @@ def _list_share_tree_api(surl: str, pwd: str) -> dict:
     返回 {"text": 目录树文本, "items": [{path,name,size,is_dir,fs_id}]} 或 {"error"}。"""
     sess = _build_pan_session()
     if sess is None:
-        return {"error": "无法获取百度网盘登录凭证，请先使用 /pan qrlogin 登录"}
+        return {"error": "无法获取百度网盘登录凭证，请先使用 /pan login 1 登录"}
     share_link = f"https://pan.baidu.com/s/{surl}"
     pf = _share_api_preflight(sess, surl, pwd, share_link)
     if "error" in pf:
@@ -1789,7 +1789,7 @@ class BaiduPanPlugin(Star):
         return f"✅ 已转存（{names}）到网盘 {cloud_dir}"
 
     async def _login_flow(self, event: AstrMessageEvent, username: str, password: str):
-        """/pan login 子命令：账密登录，全局生效"""
+        """/pan login 2/pwd 子命令：账密登录，全局生效"""
         if not event.is_private_chat():
             yield event.plain_result("⚠️ 密码会出现在聊天记录中，建议私聊执行以防泄露")
         yield event.plain_result("⏳ 正在登录百度网盘...")
@@ -1800,9 +1800,212 @@ class BaiduPanPlugin(Star):
         yield event.plain_result("✅ 登录成功！BaiduPCS-Go 已保存登录凭证，全局生效。")
         yield event.plain_result("🔐 密码已出现在聊天记录中，建议撤回/删除该消息，防止泄露")
 
+    def _login_menu(self) -> str:
+        """/pan login 登录菜单：数字简写或完整指令两种输入都可用"""
+        return (
+            "百度网盘登录/退出方式（数字简写与完整指令任选其一）:\n"
+            "1  扫码登录    /pan login 1  或  /pan login qr\n"
+            "2  账密登录    /pan login 2 <账号> <密码>  或  /pan login pwd <账号> <密码>\n"
+            "3  BDUSS       /pan login 3 <BDUSS> [STOKEN]  或  /pan login bduss <BDUSS> [STOKEN]\n"
+            "4  Cookie      /pan login 4 <完整Cookies>  或  /pan login cookies <完整Cookies>\n"
+            "0  退出登录    /pan login 0  或  /pan login out"
+        )
+
+    async def _login_dispatch(self, event: AstrMessageEvent, parts: list):
+        """/pan login <方式> [参数]：统一登录入口，负责分发到具体登录/退出流程。"""
+        if len(parts) < 2 or parts[1].lower() in ("help", "-h"):
+            yield event.plain_result(self._login_menu())
+            return
+        method = parts[1].lower()
+
+        if method in ("1", "qr", "qrcode"):
+            async for r in self._qrlogin_flow(event):
+                yield r
+            return
+
+        if method in ("2", "pwd", "password"):
+            if len(parts) < 4:
+                yield event.plain_result("用法: /pan login 2 <百度账号> <密码>（或 /pan login pwd <账号> <密码>）")
+                return
+            async for r in self._login_flow(event, parts[2], parts[3]):
+                yield r
+            return
+
+        if method in ("3", "bduss"):
+            if len(parts) < 3 or len(parts[2]) < 10:
+                yield event.plain_result(
+                    "用法: /pan login 3 <BDUSS值> [STOKEN值]（或 /pan login bduss <BDUSS> [STOKEN]）\n"
+                    "获取: 浏览器登录 pan.baidu.com → F12 → Application → Cookies → 复制 BDUSS 和 STOKEN 的值"
+                )
+                return
+            bduss = parts[2]
+            stoken = parts[3] if len(parts) >= 4 else ""
+            yield event.plain_result("⏳ 正在登录...")
+            result = await asyncio.to_thread(login_bduss_bpcs, bduss, stoken)
+            if "error" in result:
+                yield event.plain_result(f"❌ {result['error']}")
+            else:
+                extra = "（含STOKEN，转存可用）" if stoken else "（无STOKEN，转存可能不可用，仅下载）"
+                yield event.plain_result(f"✅ 登录成功！{extra}")
+            return
+
+        if method in ("4", "cookies"):
+            if len(parts) < 3 or len(parts[2]) < 50:
+                yield event.plain_result(
+                    "用法: /pan login 4 <完整Cookies字符串>（或 /pan login cookies <完整Cookies>）\n"
+                    "获取: 浏览器登录 pan.baidu.com 后 F12 → Network → 任意请求 → 复制 Cookie 请求头"
+                )
+                return
+            # Cookie 字符串本身不含空格分隔的多段，用剩余参数拼接，避免被空格截断
+            cookie_str = " ".join(parts[2:])
+            yield event.plain_result("⏳ 正在注入 Cookies...")
+            result = await asyncio.to_thread(login_cookies_bpcs, cookie_str)
+            if "error" in result:
+                yield event.plain_result(f"❌ {result['error']}")
+            else:
+                yield event.plain_result(f"✅ 登录成功！{result.get('output', '')}")
+            return
+
+        if method in ("0", "out", "logout", "off"):
+            yield event.plain_result("⏳ 正在退出登录...")
+            result = await asyncio.to_thread(logout_bpcs)
+            if "error" in result:
+                yield event.plain_result(f"❌ {result['error']}")
+            else:
+                yield event.plain_result("✅ 已退出百度网盘登录，本地凭证已清除。如需重新登录请发送 /pan login 1 扫码登录")
+            return
+
+        # 未知方式：提示并展示菜单
+        yield event.plain_result(f"未知的登录方式: {parts[1]}")
+        yield event.plain_result(self._login_menu())
+
+    async def _qrlogin_flow(self, event: AstrMessageEvent):
+        """/pan login 1/qr 子命令：扫码登录全流程（生成二维码 → 展示 → 轮询确认 → 注入凭证），全局生效"""
+        sess = _req.Session()
+        sess.headers.update({"User-Agent": _BROWSER_UA, "Accept-Language": "zh-CN,zh;q=0.9"})
+        # Step 1: 获取二维码（session 会自动保存 BAIDUID 等初始 cookie）
+        try:
+            r = await asyncio.to_thread(
+                lambda: sess.get(
+                    "https://passport.baidu.com/v2/api/getqrcode?lp=pc&qrloginfrom=pc",
+                    timeout=10,
+                )
+            )
+            qdata = r.json()
+        except Exception as e:
+            yield event.plain_result(f"❌ 获取二维码失败: {e}")
+            return
+        if qdata.get("errno") != 0:
+            yield event.plain_result("❌ 获取二维码失败")
+            return
+        qsign = qdata["sign"]
+        qimgurl = "https://" + qdata["imgurl"]
+        # 下载二维码图片
+        try:
+            img_r = await asyncio.to_thread(lambda: sess.get(qimgurl, timeout=10))
+        except Exception as e:
+            yield event.plain_result(f"❌ 下载二维码失败: {e}")
+            return
+        qr_path = os.path.join(PLUGIN_DATA_DIR, "qr_login.png")
+        os.makedirs(os.path.dirname(qr_path), exist_ok=True)
+        with open(qr_path, "wb") as f:
+            f.write(img_r.content)
+        # 发二维码图片
+        yield event.chain_result([
+            Image.fromFileSystem(qr_path),
+            Plain("请用百度网盘 APP 扫码登录（3分钟内有效）")
+        ])
+        # Step 2: 轮询扫码状态
+        gid = str(uuid.uuid4()).upper()
+        confirmed = False
+        for _ in range(60):
+            await asyncio.sleep(3)
+            tt = str(int(time.time() * 1000))
+            poll_url = (
+                f"https://passport.baidu.com/channel/unicast"
+                f"?channel_id={qsign}&gid={gid}&tpl=mm"
+                f"&_sdkFrom=1&apiver=v3&tt={tt}&_={tt}&callback="
+            )
+            try:
+                pr = await asyncio.to_thread(lambda: sess.get(poll_url, timeout=35))
+                ptext = (pr.text or "").strip()
+            except Exception:
+                continue
+            if not ptext:
+                continue
+            # 去除可能的 JSONP 包裹
+            if ptext.startswith("(") and ptext.endswith(")"):
+                ptext = ptext[1:-1]
+            if ptext.startswith("tangram") or ptext.startswith("callback"):
+                ptext = ptext[ptext.index("(")+1:ptext.rindex(")")]
+            # 解析 JSON
+            try:
+                pdata = _json.loads(ptext)
+            except Exception:
+                continue
+            if pdata.get("errno") != 0:
+                continue  # 未扫码
+            cv_str = pdata.get("channel_v", "")
+            if not cv_str:
+                continue
+            try:
+                cv = _json.loads(cv_str) if isinstance(cv_str, str) else cv_str
+            except Exception:
+                continue
+            if cv.get("status") == 1 and not confirmed:
+                confirmed = True
+                yield event.plain_result("✅ 已扫码，请在手机上确认登录")
+                continue
+            v = cv.get("v", "")
+            if v:
+                # Step 3: 用 v 换取登录凭证（session 自动带上之前累积的 cookie）
+                login_url = (
+                    f"https://passport.baidu.com/v3/login/main/qrbdusslogin"
+                    f"?bduss={v}&u=&loginVersion=v4&qrcode=1&tpl=mm&apiver=v3"
+                )
+                try:
+                    lr = await asyncio.to_thread(
+                        lambda: sess.get(login_url, timeout=10, allow_redirects=False)
+                    )
+                except Exception as e:
+                    yield event.plain_result(f"❌ 获取凭证失败: {e}")
+                    return
+                # 访问 pan.baidu.com 获取 pan 专用 cookie（csrfToken / PANPSC）
+                try:
+                    await asyncio.to_thread(
+                        lambda: sess.get("https://pan.baidu.com/disk/main", timeout=10)
+                    )
+                except Exception:
+                    pass
+                # 从 session 的 cookie jar 提取全部 cookie（已含 pan 专用 cookie）
+                full_cookie = "; ".join(f"{k}={cv2}" for k, cv2 in sess.cookies.items())
+                logger.info(f"[BaiduPan] qrlogin cookie keys: {list(sess.cookies.keys())}")
+                logger.info(f"[BaiduPan] qrlogin full_cookie len: {len(full_cookie)}")
+                bduss_m = re.search(r'BDUSS=([^\s;]+)', full_cookie)
+                if not bduss_m:
+                    yield event.plain_result("❌ 未能提取 BDUSS，登录失败")
+                    return
+                # Step 4: 用完整 cookie 登录 BaiduPCS-Go
+                result = await asyncio.to_thread(login_cookies_bpcs, full_cookie)
+                if "error" in result:
+                    # 回退到仅 BDUSS+STOKEN 方式
+                    stoken_m = re.search(r'STOKEN=([^\s;]+)', full_cookie)
+                    bduss_val = bduss_m.group(1)
+                    stoken_val = stoken_m.group(1) if stoken_m else ""
+                    result2 = await asyncio.to_thread(login_bduss_bpcs, bduss_val, stoken_val)
+                    if "error" in result2:
+                        yield event.plain_result(f"❌ {result2['error']}")
+                    else:
+                        extra = "（含STOKEN，转存可能受限）" if stoken_val else "（无STOKEN）"
+                        yield event.plain_result(f"✅ 扫码登录成功！{extra}")
+                else:
+                    yield event.plain_result("✅ 扫码登录成功！（完整cookie，转存可用）")
+                return
+        yield event.plain_result("❌ 二维码已超时，请重新发送 /pan login 1")
+
     @filter.command("pan", "下载百度网盘分享文件")
     async def on_pan(self, event: AstrMessageEvent, args: GreedyStr):
-        """用法: /pan <链接或surl> [提取码]  |  /pan login <账号> <密码>"""
+        """用法: /pan <链接或surl> [提取码]  |  /pan login 查看登录/退出菜单"""
 
         if self._is_blacklisted(event):
             return
@@ -1817,10 +2020,7 @@ class BaiduPanPlugin(Star):
                 "/pan look  重新查看目录树",
                 "/pan dir <文件夹路径>  下载文件夹",
                 "/pan file <文件路径>  下载指定文件",
-                "/pan qrlogin  扫码登录(推荐)",
-                "/pan bduss <BDUSS> [STOKEN]",
-                "/pan login <账号> <密码>",
-                "/pan unlogin  退出登录",
+                "/pan login  登录/退出统一入口（发送 /pan login 查看登录菜单）",
                 "/pan download  下载/更新 BaiduPCS-Go 工具",
                 "/pan download git  强制从 GitHub 下载（出问题时用）",
             ]
@@ -1860,9 +2060,14 @@ class BaiduPanPlugin(Star):
                 yield event.plain_result(f"❌ 下载失败: {result.get('error', '未知错误')}")
             return
 
-        # 以下命令都需要 BaiduPCS-Go.exe；登录类命令在 exe 缺失/损坏时自动下载
+        # 登录菜单是纯文本，不需要 BaiduPCS-Go，先于 exe 校验直接展示
+        if parts[0] == "login" and (len(parts) < 2 or parts[1].lower() in ("help", "-h")):
+            yield event.plain_result(self._login_menu())
+            return
+
+        # 以下命令都需要 BaiduPCS-Go.exe；登录类指令在 exe 缺失/损坏时自动下载
         if not _ensure_bpcs_exe():
-            if parts[0] not in ("qrlogin", "login", "cookies", "bduss", "unlogin"):
+            if parts[0] != "login":
                 yield event.plain_result(f"❌ {_BPCS_EXE_NAME} 缺失或损坏，请使用 /pan help 中提供的命令进行下载或查看readme")
                 return
             yield event.plain_result("⏳ BaiduPCS-Go 不存在或不可用，正在自动下载（GitHub 官方 release 优先，失败回退国内镜像）...")
@@ -1906,173 +2111,8 @@ class BaiduPanPlugin(Star):
             return
 
         if parts[0] == "login":
-            if len(parts) < 3:
-                yield event.plain_result("用法: /pan login <百度账号> <密码>")
-                return
-            async for r in self._login_flow(event, parts[1], parts[2]):
+            async for r in self._login_dispatch(event, parts):
                 yield r
-            return
-
-        if parts[0] == "unlogin":
-            yield event.plain_result("⏳ 正在退出登录...")
-            result = await asyncio.to_thread(logout_bpcs)
-            if "error" in result:
-                yield event.plain_result(f"❌ {result['error']}")
-            else:
-                yield event.plain_result("✅ 已退出百度网盘登录，本地凭证已清除。如需重新登录请私聊发送 /pan login 账号 密码")
-            return
-
-        if parts[0] == "cookies":
-            if len(parts) < 2 or len(parts[1]) < 50:
-                yield event.plain_result("用法: /pan cookies <完整Cookies字符串>（浏览器登录 pan.baidu.com 后 F12 → Network → 任意请求 → 复制 Cookie 请求头）")
-                return
-            # Cookies 字符串本身不含空格分隔的多段，用原始参数拼接，避免被空格截断
-            cookie_str = " ".join(parts[1:])
-            yield event.plain_result("⏳ 正在注入 Cookies...")
-            result = await asyncio.to_thread(login_cookies_bpcs, cookie_str)
-            if "error" in result:
-                yield event.plain_result(f"❌ {result['error']}")
-            else:
-                yield event.plain_result(f"✅ 登录成功！{result.get('output', '')}")
-            return
-
-        if parts[0] == "bduss":
-            if len(parts) < 2 or len(parts[1]) < 10:
-                yield event.plain_result("用法: /pan bduss <BDUSS值> [STOKEN值]\n获取: 浏览器登录 pan.baidu.com → F12 → Application → Cookies → 复制 BDUSS 和 STOKEN 的值")
-                return
-            bduss = parts[1]
-            stoken = parts[2] if len(parts) >= 3 else ""
-            yield event.plain_result("⏳ 正在登录...")
-            result = await asyncio.to_thread(login_bduss_bpcs, bduss, stoken)
-            if "error" in result:
-                yield event.plain_result(f"❌ {result['error']}")
-            else:
-                extra = "（含STOKEN，转存可用）" if stoken else "（无STOKEN，转存可能不可用，仅下载）"
-                yield event.plain_result(f"✅ 登录成功！{extra}")
-            return
-
-        if parts[0] == "qrlogin":
-            sess = _req.Session()
-            sess.headers.update({"User-Agent": _BROWSER_UA, "Accept-Language": "zh-CN,zh;q=0.9"})
-            # Step 1: 获取二维码（session 会自动保存 BAIDUID 等初始 cookie）
-            try:
-                r = await asyncio.to_thread(
-                    lambda: sess.get(
-                        "https://passport.baidu.com/v2/api/getqrcode?lp=pc&qrloginfrom=pc",
-                        timeout=10,
-                    )
-                )
-                qdata = r.json()
-            except Exception as e:
-                yield event.plain_result(f"❌ 获取二维码失败: {e}")
-                return
-            if qdata.get("errno") != 0:
-                yield event.plain_result("❌ 获取二维码失败")
-                return
-            qsign = qdata["sign"]
-            qimgurl = "https://" + qdata["imgurl"]
-            # 下载二维码图片
-            try:
-                img_r = await asyncio.to_thread(lambda: sess.get(qimgurl, timeout=10))
-            except Exception as e:
-                yield event.plain_result(f"❌ 下载二维码失败: {e}")
-                return
-            qr_path = os.path.join(PLUGIN_DATA_DIR, "qr_login.png")
-            os.makedirs(os.path.dirname(qr_path), exist_ok=True)
-            with open(qr_path, "wb") as f:
-                f.write(img_r.content)
-            # 发二维码图片
-            yield event.chain_result([
-                Image.fromFileSystem(qr_path),
-                Plain("请用百度网盘 APP 扫码登录（3分钟内有效）")
-            ])
-            # Step 2: 轮询扫码状态
-            gid = str(uuid.uuid4()).upper()
-            confirmed = False
-            for _ in range(60):
-                await asyncio.sleep(3)
-                tt = str(int(time.time() * 1000))
-                poll_url = (
-                    f"https://passport.baidu.com/channel/unicast"
-                    f"?channel_id={qsign}&gid={gid}&tpl=mm"
-                    f"&_sdkFrom=1&apiver=v3&tt={tt}&_={tt}&callback="
-                )
-                try:
-                    pr = await asyncio.to_thread(lambda: sess.get(poll_url, timeout=35))
-                    ptext = (pr.text or "").strip()
-                except Exception:
-                    continue
-                if not ptext:
-                    continue
-                # 去除可能的 JSONP 包裹
-                if ptext.startswith("(") and ptext.endswith(")"):
-                    ptext = ptext[1:-1]
-                if ptext.startswith("tangram") or ptext.startswith("callback"):
-                    ptext = ptext[ptext.index("(")+1:ptext.rindex(")")]
-                # 解析 JSON
-                try:
-                    pdata = _json.loads(ptext)
-                except Exception:
-                    continue
-                if pdata.get("errno") != 0:
-                    continue  # 未扫码
-                cv_str = pdata.get("channel_v", "")
-                if not cv_str:
-                    continue
-                try:
-                    cv = _json.loads(cv_str) if isinstance(cv_str, str) else cv_str
-                except Exception:
-                    continue
-                if cv.get("status") == 1 and not confirmed:
-                    confirmed = True
-                    yield event.plain_result("✅ 已扫码，请在手机上确认登录")
-                    continue
-                v = cv.get("v", "")
-                if v:
-                    # Step 3: 用 v 换取登录凭证（session 自动带上之前累积的 cookie）
-                    login_url = (
-                        f"https://passport.baidu.com/v3/login/main/qrbdusslogin"
-                        f"?bduss={v}&u=&loginVersion=v4&qrcode=1&tpl=mm&apiver=v3"
-                    )
-                    try:
-                        lr = await asyncio.to_thread(
-                            lambda: sess.get(login_url, timeout=10, allow_redirects=False)
-                        )
-                    except Exception as e:
-                        yield event.plain_result(f"❌ 获取凭证失败: {e}")
-                        return
-                    # 访问 pan.baidu.com 获取 pan 专用 cookie（csrfToken / PANPSC）
-                    try:
-                        await asyncio.to_thread(
-                            lambda: sess.get("https://pan.baidu.com/disk/main", timeout=10)
-                        )
-                    except Exception:
-                        pass
-                    # 从 session 的 cookie jar 提取全部 cookie（已含 pan 专用 cookie）
-                    full_cookie = "; ".join(f"{k}={cv2}" for k, cv2 in sess.cookies.items())
-                    logger.info(f"[BaiduPan] qrlogin cookie keys: {list(sess.cookies.keys())}")
-                    logger.info(f"[BaiduPan] qrlogin full_cookie len: {len(full_cookie)}")
-                    bduss_m = re.search(r'BDUSS=([^\s;]+)', full_cookie)
-                    if not bduss_m:
-                        yield event.plain_result("❌ 未能提取 BDUSS，登录失败")
-                        return
-                    # Step 4: 用完整 cookie 登录 BaiduPCS-Go
-                    result = await asyncio.to_thread(login_cookies_bpcs, full_cookie)
-                    if "error" in result:
-                        # 回退到仅 BDUSS+STOKEN 方式
-                        stoken_m = re.search(r'STOKEN=([^\s;]+)', full_cookie)
-                        bduss_val = bduss_m.group(1)
-                        stoken_val = stoken_m.group(1) if stoken_m else ""
-                        result2 = await asyncio.to_thread(login_bduss_bpcs, bduss_val, stoken_val)
-                        if "error" in result2:
-                            yield event.plain_result(f"❌ {result2['error']}")
-                        else:
-                            extra = "（含STOKEN，转存可能受限）" if stoken_val else "（无STOKEN）"
-                            yield event.plain_result(f"✅ 扫码登录成功！{extra}")
-                    else:
-                        yield event.plain_result("✅ 扫码登录成功！（完整cookie，转存可用）")
-                    return
-            yield event.plain_result("❌ 二维码已超时，请重新发送 /pan qrlogin")
             return
 
         if parts[0] in ("dir", "folder", "fl"):

@@ -17,7 +17,7 @@
 - **大小与超时控制**：可配置最大下载大小（默认不限制）与下载超时（默认不超时）
 - **多平台适配**：napcat / SnowLuma（OneBot）、QQ 官方机器人、其他平台三种发送模式，大文件自动闪传
 - **自动清理**：下载完成后自动删除网盘转存文件；可配置定时清理本地下载文件（只清理本插件下载的）
-- **扫码登录**：主推 `/pan qrlogin`，无需密码、不怕风控；也可配置 `bduuss` 启动时自动登录
+- **扫码登录**：主推 `/pan login 1`（或 `/pan login qr`），无需密码、不怕风控；也可配置 `bduuss` 启动时自动登录
 - **自动下载工具**：首次登录自动下载 BaiduPCS-Go，无需手动安装；网络差时自动回退国内镜像
 - **用户黑名单**：可配置黑名单，被拉黑用户的消息不回复（仅 OneBot 模式）
 
@@ -30,11 +30,12 @@
 | `/pan look` | 全部 | 重新查看最近一次的目录树 |
 | `/pan dir <文件夹路径>` | 全部 | 下载文件夹 |
 | `/pan file <文件路径>` | 全部 | 下载指定文件 |
-| `/pan qrlogin` | 全部 | 扫码登录（推荐） |
-| `/pan bduss <BDUSS> [STOKEN]` | 全部 | BDUSS 登录 |
-| `/pan cookies <完整Cookie字符串>` | 全部 | Cookie 登录 |
-| `/pan login <账号> <密码>` | 全部 | 账密登录（建议私聊使用） |
-| `/pan unlogin` | 全部 | 退出登录 |
+| `/pan login` | 全部 | 登录/退出统一入口，发送后显示完整登录菜单 |
+| `/pan login 1` 或 `qr` | 全部 | 扫码登录（推荐） |
+| `/pan login 2 <账号> <密码>` 或 `pwd ...` | 全部 | 账密登录（建议私聊使用） |
+| `/pan login 3 <BDUSS> [STOKEN]` 或 `bduss ...` | 全部 | BDUSS 登录 |
+| `/pan login 4 <完整Cookie字符串>` 或 `cookies ...` | 全部 | Cookie 登录 |
+| `/pan login 0` 或 `out` | 全部 | 退出登录 |
 | `/pan download` | 全部 | 下载或重新下载 BaiduPCS-Go 工具（文件损坏时也可修复） |
 | `/pan download git` | 全部 | 强制从 GitHub 官方 release 下载（国内镜像失效时使用） |
 | `/pan help` | 全部 | 查看帮助 |
@@ -88,13 +89,16 @@
 
 ### 登录说明
 
-- **扫码登录（推荐）**：发送 `/pan qrlogin`，用百度网盘 APP 扫码确认，全程无需输入账号密码；二维码 3 分钟有效，凭证保存在本机，重启 AstrBot 无需重新登录
-- **BDUSS 登录**：浏览器 F12 → Application → Cookies 复制 BDUSS（和 STOKEN）后发送 `/pan bduss <BDUSS> [STOKEN]`
-- **账密登录**：`/pan login <账号> <密码>`，建议私聊执行并用后撤回消息；百度风控可能返回 50052，此时改用扫码或 BDUSS
+- **扫码登录（推荐）**：发送 `/pan login 1`（或 `/pan login qr`），用百度网盘 APP 扫码确认，全程无需输入账号密码；二维码 3 分钟有效，凭证保存在本机，重启 AstrBot 无需重新登录
+- **账密登录**：`/pan login 2 <账号> <密码>`（或 `/pan login pwd <账号> <密码>`），建议私聊执行并用后撤回消息；百度风控可能返回 50052，此时改用扫码或 BDUSS
+- **BDUSS 登录**：浏览器 F12 → Application → Cookies 复制 BDUSS（和 STOKEN）后发送 `/pan login 3 <BDUSS> [STOKEN]`（或 `/pan login bduss <BDUSS> [STOKEN]`）
+- **Cookie 登录**：浏览器 F12 → Network → 任意请求 → 复制 Cookie 请求头后发送 `/pan login 4 <完整Cookies>`（或 `/pan login cookies <完整Cookies>`）
+- **退出登录**：发送 `/pan login 0`（或 `/pan login out`）
+- 记不住方式？发送 `/pan login` 即可查看完整登录菜单，所有方式都支持数字简写与完整指令两种输入
 
 ### BaiduPCS-Go
 
-插件**不内置** BaiduPCS-Go（Windows 下为 `BaiduPCS-Go.exe`，Linux/macOS 下为无扩展名的 `BaiduPCS-Go`）。**无需手动下载**：首次执行登录类命令（`/pan qrlogin`、`/pan login`、`/pan cookies`、`/pan bduss`，或配置 `bduuss` 启动自动登录）时会自动下载 GitHub 官方 **最新 release** 中**当前平台对应**的二进制（Windows / Linux / macOS，x64 / arm64 自动匹配；GitHub 不可达时自动回退国内镜像，**国内镜像仅提供 Windows 版**），保存在**插件目录**下；也可手动用 `/pan download` 下载/更新，文件损坏用同一命令修复，只走 GitHub 时用 `/pan download git`。
+插件**不内置** BaiduPCS-Go（Windows 下为 `BaiduPCS-Go.exe`，Linux/macOS 下为无扩展名的 `BaiduPCS-Go`）。**无需手动下载**：首次执行登录类命令（`/pan login 1` 扫码、`/pan login 2` 账密、`/pan login 3` BDUSS、`/pan login 4` Cookie，或配置 `bduuss` 启动自动登录）时会自动下载 GitHub 官方 **最新 release** 中**当前平台对应**的二进制（Windows / Linux / macOS，x64 / arm64 自动匹配；GitHub 不可达时自动回退国内镜像，**国内镜像仅提供 Windows 版**），保存在**插件目录**下；也可手动用 `/pan download` 下载/更新，文件损坏用同一命令修复，只走 GitHub 时用 `/pan download git`。
 
 > 数据存放：下载的文件、下载清单、登录二维码等运行时数据存放于 AstrBot 插件数据目录 `data/plugin_data/astrbot_plugin_baidu_netdisk/`（升级/重装插件不丢失）；登录凭证（`pcs_config.json`）沿用 BaiduPCS-Go 默认位置（Windows: `%APPDATA%/BaiduPCS-Go/`，Linux/macOS: `~/.config/BaiduPCS-Go/`；若**插件目录**（exe 同目录）已存在 `pcs_config.json`，BaiduPCS-Go 与插件都会自动优先使用它，也可用 `BAIDUPCS_GO_CONFIG_DIR` 环境变量显式指定），不随插件数据清理。
 
