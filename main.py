@@ -1591,18 +1591,21 @@ class BaiduPanPlugin(Star):
         _lock_acquired = False
         parts = [p for p in str(args).split() if p]
         if not parts or parts[0] == "help":
-            yield event.plain_result("用法:")
-            yield event.plain_result("/pan <链接> [密码]  查看目录树")
-            yield event.plain_result("/pan ls [链接] [密码]  查看目录树（不下载文件，无参数重看缓存）")
-            yield event.plain_result("/pan look  重新查看目录树")
-            yield event.plain_result("/pan dir <文件夹路径>  下载文件夹")
-            yield event.plain_result("/pan file <文件路径>  下载指定文件")
-            yield event.plain_result("/pan qrlogin  扫码登录(推荐)")
-            yield event.plain_result("/pan bduss <BDUSS> [STOKEN]")
-            yield event.plain_result("/pan login <账号> <密码>")
-            yield event.plain_result("/pan unlogin  退出登录")
-            yield event.plain_result("/pan download  下载/更新 BaiduPCS-Go 工具")
-            yield event.plain_result("/pan download git  强制从 GitHub 下载（出问题时用）")
+            help_lines = [
+                "用法:",
+                "/pan <链接> [密码]  查看目录树",
+                "/pan ls [链接] [密码]  查看目录树（不下载文件，无参数重看缓存）",
+                "/pan look  重新查看目录树",
+                "/pan dir <文件夹路径>  下载文件夹",
+                "/pan file <文件路径>  下载指定文件",
+                "/pan qrlogin  扫码登录(推荐)",
+                "/pan bduss <BDUSS> [STOKEN]",
+                "/pan login <账号> <密码>",
+                "/pan unlogin  退出登录",
+                "/pan download  下载/更新 BaiduPCS-Go 工具",
+                "/pan download git  强制从 GitHub 下载（出问题时用）",
+            ]
+            yield event.plain_result("\n".join(help_lines))
             sponsor_path = os.path.join(os.path.dirname(__file__), "sponsor.png")
             if os.path.exists(sponsor_path):
                 yield event.chain_result([
