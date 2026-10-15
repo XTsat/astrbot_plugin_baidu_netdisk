@@ -18,6 +18,7 @@
 - **多平台适配**：napcat / SnowLuma（OneBot）、QQ 官方机器人、其他平台三种发送模式，大文件自动闪传
 - **自动清理**：下载完成后自动删除网盘转存文件；可配置定时清理本地下载文件（只清理本插件下载的）
 - **扫码登录**：主推 `/pan qrlogin`，无需密码、不怕风控；也可配置 `bduuss` 启动时自动登录
+- **自动下载工具**：首次登录自动下载 BaiduPCS-Go，无需手动安装；网络差时自动回退国内镜像
 - **用户黑名单**：可配置黑名单，被拉黑用户的消息不回复（仅 OneBot 模式）
 
 ## 指令
@@ -93,7 +94,7 @@
 
 ### BaiduPCS-Go
 
-插件**不内置** BaiduPCS-Go.exe，首次使用执行 `/pan download` 自动下载 GitHub 官方 **最新 release**（GitHub 不可达时自动回退国内镜像）；文件损坏用同一命令修复，只走 GitHub 时用 `/pan download git`。
+插件**不内置** BaiduPCS-Go.exe。**无需手动下载**：首次执行登录类命令（`/pan qrlogin`、`/pan login`、`/pan cookies`、`/pan bduss`，或配置 `bduuss` 启动自动登录）时会自动下载 GitHub 官方 **最新 release**（GitHub 不可达时自动回退国内镜像）；也可手动用 `/pan download` 下载/更新，文件损坏用同一命令修复，只走 GitHub 时用 `/pan download git`。
 
 ### 安全声明
 

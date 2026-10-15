@@ -51,6 +51,8 @@ _BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 _exe_ok_cache = {"sig": None}  # 已验证可用的 exe 的 (mtime, size)，避免每次请求都 spawn 进程
 _cleanup_thread_started = False
 _share_switch_lock = threading.Lock()  # 串行化“切换分享链接”（rm 旧转存 + 转存新链接 + 更新缓存）
+_auto_dl_lock = threading.Lock()  # 串行化登录时的自动下载（同一时间只允许一个下载任务）
+_auto_dl_failed = False  # 自动下载失败缓存标记：避免 exe 缺失且网络不通时每次登录都长时间重试；/pan download 会重置
 
 
 def _ensure_bpcs_exe() -> bool:
@@ -70,6 +72,33 @@ def _ensure_bpcs_exe() -> bool:
     if ok:  # 只缓存成功结果，失败时下次重试
         _exe_ok_cache["sig"] = sig
     return ok
+
+
+def _auto_download_bpcs() -> bool:
+    """确保 BaiduPCS-Go 可用：缺失或损坏时自动下载（GitHub 官方 release 优先，国内镜像兜底）。
+    并发安全（同一时间只允许一个下载任务）；下载失败会缓存标记，避免每次登录都长时间重试。"""
+    global _auto_dl_failed
+    if _ensure_bpcs_exe():
+        return True
+    if _auto_dl_failed:
+        logger.warning("[BaiduPan] BaiduPCS-Go 不可用且此前自动下载失败，跳过自动下载（可用 /pan download 手动重试）")
+        return False
+    with _auto_dl_lock:
+        if _ensure_bpcs_exe():
+            return True
+        if _auto_dl_failed:
+            return False
+        logger.info("[BaiduPan] BaiduPCS-Go 不存在或不可用，开始自动下载...")
+        result = _download_github_exe()
+        if "error" in result:
+            logger.warning(f"[BaiduPan] GitHub 自动下载失败，回退国内镜像: {result['error']}")
+            result = _download_cn_exe()
+        if "error" in result:
+            _auto_dl_failed = True
+            logger.error(f"[BaiduPan] BaiduPCS-Go 自动下载失败: {result['error']}")
+            return False
+        _auto_dl_failed = False
+        return _ensure_bpcs_exe()
 
 
 def _fetch_release_info() -> dict | None:
@@ -227,7 +256,7 @@ def _init_bpcs() -> bool:
         if _bpcs_inited:
             return True
         if not _ensure_bpcs_exe():
-            logger.warning(f"[BaiduPan] BaiduPCS-Go.exe 不可用，请使用 /pan help 中提供的命令进行下载或查看readme")
+            logger.warning("[BaiduPan] BaiduPCS-Go.exe 不可用，登录时会自动尝试下载，也可用 /pan download 手动下载")
             return False
         out, _, code = _run_bpcs(["who"], timeout=15)
         if code == 0 and out and "登录" not in (out or "") and "未登录" not in (out or ""):
@@ -251,8 +280,8 @@ def _bpcs_config_path() -> str:
 def login_bduss_bpcs(bduss: str, stoken: str = "") -> dict:
     """用 BDUSS + STOKEN 登录 BaiduPCS-Go。"""
     global _bpcs_inited
-    if not _ensure_bpcs_exe():
-        return {"error": "BaiduPCS-Go.exe 缺失或损坏，请使用 /pan help 中提供的命令进行下载或查看readme"}
+    if not _auto_download_bpcs():
+        return {"error": "BaiduPCS-Go.exe 不可用且自动下载失败，请稍后重试（或用 /pan download 手动下载）"}
     args = ["login", f"-bduss={bduss}"]
     if stoken:
         args.append(f"-stoken={stoken}")
@@ -294,8 +323,8 @@ def _patch_config_stoken(stoken: str, bduss: str = ""):
 def login_cookies_bpcs(cookie_str: str) -> dict:
     """用完整 Cookie 字符串登录 BaiduPCS-Go（v4.0.1 支持 -cookies 参数）。"""
     global _bpcs_inited
-    if not _ensure_bpcs_exe():
-        return {"error": "BaiduPCS-Go.exe 缺失或损坏，请使用 /pan help 中提供的命令进行下载或查看readme"}
+    if not _auto_download_bpcs():
+        return {"error": "BaiduPCS-Go.exe 不可用且自动下载失败，请稍后重试（或用 /pan download 手动下载）"}
     # 清洗：去掉可能干扰的空名项（如 =value）和 *_BFESS 字段
     cleaned = "; ".join(
         part.strip() for part in cookie_str.split(";")
@@ -323,8 +352,8 @@ def login_bpcs(username: str, password: str) -> dict:
     """用百度账号密码登录 BaiduPCS-Go，登录成功后凭证保存在本地，全局生效。
     优先走交互式 stdin 输入，避免密码出现在进程命令行（同机其他进程可见）。"""
     global _bpcs_inited
-    if not _ensure_bpcs_exe():
-        return {"error": "BaiduPCS-Go.exe 缺失或损坏，请使用 /pan help 中提供的命令进行下载或查看readme"}
+    if not _auto_download_bpcs():
+        return {"error": "BaiduPCS-Go.exe 不可用且自动下载失败，请稍后重试（或用 /pan download 手动下载）"}
 
     # 方式一：交互式输入（密码不进命令行）
     try:
@@ -362,8 +391,8 @@ def login_bpcs(username: str, password: str) -> dict:
 def logout_bpcs() -> dict:
     """退出 BaiduPCS-Go 当前登录的百度帐号，清除本地凭证。"""
     global _bpcs_inited
-    if not _ensure_bpcs_exe():
-        return {"error": "BaiduPCS-Go.exe 缺失或损坏，请使用 /pan help 中提供的命令进行下载或查看readme"}
+    if not _auto_download_bpcs():
+        return {"error": "BaiduPCS-Go.exe 不可用且自动下载失败，请稍后重试（或用 /pan download 手动下载）"}
     out, err, code = _run_bpcs(["logout", "-y"], timeout=30)
     text = (out or "") + chr(10) + (err or "")
     if code == 0:
@@ -1082,7 +1111,7 @@ class BaiduPanPlugin(Star):
         if _ensure_bpcs_exe():
             _run_bpcs(["config", "set", "-savedir", DOWNLOAD_DIR], timeout=15)
         else:
-            logger.warning("[BaiduPan] BaiduPCS-Go.exe 不可用，请使用 /pan help 中提供的命令进行下载或查看readme，配置将在下载后生效")
+            logger.warning("[BaiduPan] BaiduPCS-Go.exe 不可用，首次登录时会自动下载，配置将在下载后生效")
 
         # 解析黑名单
         bl = str(self.config.get("blacklist", "")).strip()
@@ -1587,6 +1616,8 @@ class BaiduPanPlugin(Star):
             return
 
         if parts[0] == "download":
+            global _auto_dl_failed
+            _auto_dl_failed = False  # 手动下载即重试自动下载标记
             if len(parts) > 1 and parts[1] == "git":
                 # 强制只走 GitHub 官方 release，不回退国内镜像
                 yield event.plain_result("⏳ 正在从 GitHub 官方 release 下载最新版 BaiduPCS-Go...")
@@ -1611,10 +1642,15 @@ class BaiduPanPlugin(Star):
                 yield event.plain_result(f"❌ 下载失败: {result.get('error', '未知错误')}")
             return
 
-        # 以下命令都需要 BaiduPCS-Go.exe
+        # 以下命令都需要 BaiduPCS-Go.exe；登录类命令在 exe 缺失/损坏时自动下载
         if not _ensure_bpcs_exe():
-            yield event.plain_result("❌ BaiduPCS-Go.exe 缺失或损坏，请使用 /pan help 中提供的命令进行下载或查看readme")
-            return
+            if parts[0] not in ("qrlogin", "login", "cookies", "bduss", "unlogin"):
+                yield event.plain_result("❌ BaiduPCS-Go.exe 缺失或损坏，请使用 /pan help 中提供的命令进行下载或查看readme")
+                return
+            yield event.plain_result("⏳ BaiduPCS-Go 不存在或不可用，正在自动下载（GitHub 官方 release 优先，失败回退国内镜像）...")
+            if not await asyncio.to_thread(_auto_download_bpcs):
+                yield event.plain_result("❌ BaiduPCS-Go 自动下载失败，请稍后重试（或用 /pan download 手动下载）")
+                return
 
         if parts[0] == "look":
             if self._cached_tree:
