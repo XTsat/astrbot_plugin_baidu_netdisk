@@ -13,6 +13,7 @@
 - **抗分享页故障**：转存/列目录不依赖分享页打开，分享页故障时依然可用
 - **国内外可用**：服务器在国外也能下载百度网盘文件
 - **目录查看与按需下载**：查看分享目录树，按需下载文件夹或单个文件
+- **文件夹自动发送**：QQ 等平台不能直接发文件夹，插件自动处理——≤3 个文件（可配）逐个发送（原始文件更易命中秒传），更多则打包 zip 当单文件发送；zip 按文件类型自适应压缩（视频/图片等已压缩格式不重复压缩，打包更快）；体积超过上限或磁盘空间不足时返回本地路径与文件清单
 - **LLM 工具**：`pan_list` / `pan_transfer` / `pan_download_dir` / `pan_download_all`，AI 自动识别网盘链接并执行查看/转存/下载
 - **大小与超时控制**：可配置最大下载大小（默认不限制）与下载超时（默认不超时）
 - **多平台适配**：napcat / SnowLuma（OneBot）、QQ 官方机器人、其他平台三种发送模式，大文件自动闪传
@@ -27,8 +28,7 @@
 |------|------|------|
 | `/pan <链接或surl> [提取码]` | 全部 | 查看分享目录树（并缓存链接）；支持直接粘贴整段分享文案，自动识别链接与提取码 |
 | `/pan look` | 全部 | 重新查看最近一次的目录树 |
-| `/pan dir <文件夹路径>` | 全部 | 下载文件夹 |
-| `/pan file <文件路径>` | 全部 | 下载指定文件 |
+| `/pan down <路径>` | 全部 | 下载文件夹或单个文件（自动识别类型）；文件夹 ≤3 个文件逐个发送，更多则打包 zip 发送 |
 | `/pan login` | 全部 | 登录/退出统一入口，发送后显示完整登录菜单 |
 | `/pan login 1` 或 `qr` | 全部 | 扫码登录（推荐） |
 | `/pan login 2 <账号> <密码>` 或 `pwd ...` | 全部 | 账密登录（建议私聊使用） |
@@ -46,8 +46,8 @@
 ```
 /pan https://pan.baidu.com/s/1abc123?pwd=abcd   # 查看目录树（链接自带提取码）
 /pan 通过百度网盘分享的文件：xxx.zip 链接:https://pan.baidu.com/s/1abc123 提取码:abcd   # 整段分享文案可直接粘贴
-/pan dir 文件夹路径                              # 下载文件夹
-/pan file 文件路径                               # 下载指定文件
+/pan down 文件夹路径                              # 下载文件夹
+/pan down 文件路径                                # 下载单个文件
 ```
 
 > 💡 链接识别很宽松：`/s/xxx`、`share/init?surl=xxx`、无协议头、`yun.baidu.com`、短链都支持；提取码支持 `?pwd=xxxx`、`提取码:xxxx`、`提取码：xxxx`、`密码:`、`访问码:`（半角/全角冒号均可），整段中文分享文案直接粘贴即可。
@@ -63,6 +63,8 @@
 | 登录提示（`login_hint`） | string | read | 仅提示用，无需填写 |
 | BDUSS Cookie（`bduuss`） | string | 空 | 填写后启动时自动登录；浏览器 F12 → Application → Cookies 获取 BDUSS |
 | 最大下载大小（`max_file_size`） | int | 0 | 0=不限制；official 模式硬限 200MB |
+| 文件夹打包上限（`zip_max_size`） | int | 10240 | 文件夹打包 zip 的大小上限（MB），0=不限制；超过则不打包，返回本地路径+文件清单 |
+| 逐个发送阈值（`send_files_threshold`） | int | 3 | 文件夹内文件数 ≤ 此值时逐个发送（更易命中秒传）；超过则打包 zip；0=总是打包 |
 | 发送模式（`send_mode`） | string | onebot | onebot：napcat/SnowLuma；official：QQ 官方；other：其他平台 |
 | 用户黑名单（`blacklist`） | string | 空 | 多个 QQ 号用逗号分隔；仅 onebot 模式生效 |
 | 本地下载目录（`download_dir`） | string | 空 | 留空用 AstrBot 插件数据目录 `data/plugin_data/astrbot_plugin_baidu_netdisk/downloads/` |
@@ -118,7 +120,7 @@
 - 下载文件暂存于 `download_dir`（默认 AstrBot 插件数据目录 `data/plugin_data/astrbot_plugin_baidu_netdisk/downloads/`），用 `local_cleanup_hour` 定时清理（只清理本插件下载的文件）
 - 下载完成默认自动删除网盘转存文件（回收站可找回），可关闭 `auto_delete_cloud`
 - 文件超过 `max_file_size` 限制时返回原分享链接
-- 网盘剩余空间不足时整包下载/转存会失败并明确提示，可改用 `/pan file <路径>` 或让 LLM 分批挑选
+- 网盘剩余空间不足时整包下载/转存会失败并明确提示，可改用 `/pan down <路径>` 或让 LLM 分批挑选
 - 分享链接在百度侧失效（打开报 500 或「链接出错」）时插件会明确报错，需分享者重新分享
 - napcat 闪传存在已知 BUG（Issue #2015），大文件闪传可能失败并降级为返回链接
 - QQ 官方机器人模式超 200MB 会在下载前直接拦截并返回链接

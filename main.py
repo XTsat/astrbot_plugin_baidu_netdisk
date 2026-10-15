@@ -9,6 +9,7 @@ import os
 import platform
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -124,6 +125,8 @@ PLUGIN_DATA_DIR = _resolve_plugin_data_dir()
 DOWNLOAD_DIR = None  # 初始化时根据配置设置
 CLOUD_SAVE_DIR = None  # 网盘转存目录
 FLASH_TASK_LIMIT_MB = 200
+_ZIP_MAX_MB_DEFAULT = 10240  # 文件夹打包上限默认值（MB，10GB 对应 QQ 闪传大文件通道）；可在配置中修改，0=不限制
+_SEND_FILES_THRESHOLD_DEFAULT = 3  # 文件夹内文件数 ≤ 此值时逐个发送（原始文件更易命中秒传），超过则打包 zip
 DOWNLOAD_TIMEOUT_SECONDS = -1  # 下载超时秒数，-1 = 不超时（可在配置中修改）
 
 # 本插件下载过的本地文件清单，定时清理时只删这些，不动下载目录里的其他文件
@@ -886,7 +889,7 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str, fs_ids: list = None
             if -32 in errnos or "空间不足" in (resp5.get("show_msg") or ""):
                 need_gb = (resp5.get("target_size") or 0) / 1024 ** 3
                 return {"error": f"网盘剩余空间不足，无法转存（本次约需 {need_gb:.0f} GB）。"
-                                 f"请只选择需要的文件/文件夹下载（/pan file <路径>）"}
+                                 f"请只选择需要的文件/文件夹下载（/pan down <路径>）"}
             return {"error": f"转存失败: {resp5.get('show_msg') or '文件冲突'}"}
         else:
             show_msg = resp5.get("show_msg", "") or resp5.get("err_msg", "")
@@ -1079,7 +1082,7 @@ def _list_share_tree_api(surl: str, pwd: str) -> dict:
         if len(items) > 300:
             state["truncated"] = True
             return
-        if depth > 2:  # 最多展示 3 层，更深的用 /pan file <路径> 按需下载
+        if depth > 2:  # 最多展示 3 层，更深的用 /pan down <路径> 按需下载
             return
         params = {"bdstoken": bdstoken, "web": "5", "app_id": "250528",
                   "shorturl": short, "channel": "chunlei", "clienttype": "0", "num": "100"}
@@ -1123,7 +1126,7 @@ def _list_share_tree_api(surl: str, pwd: str) -> dict:
     if not lines:
         return {"error": "目录为空或获取失败"}
     if state["truncated"]:
-        lines.append("（目录过多已截断，建议用 /pan file <路径> 直接下载需要的文件）")
+        lines.append("（目录过多已截断，建议用 /pan down <路径> 直接下载需要的文件）")
     return {"text": "\n".join(lines), "items": items}
 
 
@@ -1305,6 +1308,53 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
         return {"path": local_path, "size": os.path.getsize(local_path), "name": file_name}
 
 
+# 这些扩展名本身已是压缩格式：再 DEFLATE 几乎无收益还白费 CPU/时间，直接 STORED 拼装（速度接近 tar）
+# 注意不含 wav/bmp/tif 这类未压缩格式——它们 DEFLATE 收益明显，仍走压缩
+_PRECOMPRESSED_EXT = {
+    # 视频
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".rmvb", ".mpg", ".mpeg", ".ts", ".vob",
+    # 图片
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".avif",
+    # 音频
+    ".mp3", ".flac", ".aac", ".m4a", ".ogg", ".wma", ".ape",
+    # 压缩包 / 安装包
+    ".zip", ".rar", ".7z", ".gz", ".bz2", ".xz", ".zst", ".cab", ".apk", ".ipa",
+    # 本质是 zip 容器 / 内部已压缩
+    ".pdf", ".docx", ".xlsx", ".pptx",
+}
+
+
+def _zip_files(files: list, zip_path: str, top_name: str = "") -> dict:
+    """把已下载的文件列表打包为 zip（QQ 等平台不能直接发文件夹，打包后当单文件发送）。
+    files: [{"path", "name", "size"}]；zip 内保留相对目录结构，顶层优先用 top_name。
+    压缩方式按文件类型自适应：已压缩格式（视频/图片/音频/压缩包/Office）用 STORED 直接拼装（快），
+    其余文本类用 DEFLATE。返回 {"path", "name", "size", "stored", "deflated"} 或 {"error": ...}。"""
+    import zipfile as _zf
+    paths = [f.get("path") for f in files if f.get("path") and os.path.isfile(f["path"])]
+    if not paths:
+        return {"error": "未找到可打包的文件"}
+    stored = deflated = 0
+    try:
+        os.makedirs(os.path.dirname(zip_path), exist_ok=True)
+        common = os.path.commonpath(paths) if len(paths) > 1 else os.path.dirname(paths[0])
+        with _zf.ZipFile(zip_path, "w", allowZip64=True) as zf:
+            for fp in paths:
+                rel = os.path.relpath(fp, common)
+                # zip 内统一保留下载文件夹这一层（解压即得同名文件夹），但不重复套同名目录
+                if top_name and rel != top_name and not rel.startswith(top_name + os.sep):
+                    rel = f"{top_name}/{rel}"
+                if os.path.splitext(fp)[1].lower() in _PRECOMPRESSED_EXT:
+                    zf.write(fp, rel, compress_type=_zf.ZIP_STORED)
+                    stored += 1
+                else:
+                    zf.write(fp, rel, compress_type=_zf.ZIP_DEFLATED)
+                    deflated += 1
+        return {"path": zip_path, "name": os.path.basename(zip_path),
+                "size": os.path.getsize(zip_path), "stored": stored, "deflated": deflated}
+    except Exception as e:
+        return {"error": f"打包失败: {e}"}
+
+
 def _get_account_folder() -> str:
     """从 BPCS 配置读取当前登录账号的 uid 和 name，返回账号文件夹名（如 620186943_hitomi999）。"""
     cfg_path = _bpcs_config_path()
@@ -1452,7 +1502,7 @@ class BaiduPanPlugin(Star):
     def _ensure_transferred_sync(self, cloud_path: str) -> dict:
         """把选中的分享内容（单个文件/文件夹）按 fs_id 精准转存到暂存目录。
         只转存所需项，避免整包转存撑爆网盘空间（大分享整包动辄上 TB）。
-        返回 {"name": 转存后的文件/文件夹名} 或 {"error": ...}。"""
+        返回 {"name": 转存后的文件/文件夹名, "is_dir": 是否为文件夹} 或 {"error": ...}。"""
         if not self._cached_surl:
             return {"error": "请先查看目录: /pan <链接> [密码]"}
         items = self._cached_items or []
@@ -1475,7 +1525,7 @@ class BaiduPanPlugin(Star):
                               fs_ids=[target["fs_id"]])
         if "error" in r:
             return r
-        return {"name": target["name"]}
+        return {"name": target["name"], "is_dir": bool(target.get("is_dir"))}
 
     def _check_switch_allowed(self, surl: str) -> str:
         """切换到新链接前检查是否有下载正在进行（避免缓存被覆盖导致路径串台）。"""
@@ -1532,6 +1582,20 @@ class BaiduPanPlugin(Star):
 
     def _get_send_mode(self) -> str:
         return str(self.config.get("send_mode", "onebot")).strip().lower()
+
+    def _get_zip_max_mb(self) -> int:
+        """文件夹打包 zip 的体积上限（MB），0 = 不限制。"""
+        try:
+            return max(0, int(self.config.get("zip_max_size", _ZIP_MAX_MB_DEFAULT)))
+        except (TypeError, ValueError):
+            return _ZIP_MAX_MB_DEFAULT
+
+    def _get_send_files_threshold(self) -> int:
+        """文件夹内文件数 ≤ 此值时逐个发送（原始文件更易命中秒传），0 = 总是打包。"""
+        try:
+            return max(0, int(self.config.get("send_files_threshold", _SEND_FILES_THRESHOLD_DEFAULT)))
+        except (TypeError, ValueError):
+            return _SEND_FILES_THRESHOLD_DEFAULT
 
     async def _send_file(self, event: AstrMessageEvent, dl: dict, share_url: str = "") -> bool:
         """根据平台类型和文件大小选择发送方式。"""
@@ -1615,6 +1679,95 @@ class BaiduPanPlugin(Star):
             pass
         return False
 
+    async def _send_folder(self, event: AstrMessageEvent, dl: dict, share_url: str = "",
+                           label: str = "") -> str:
+        """文件夹下载完成后的发送策略（QQ 等平台不能直接发送文件夹）：
+        文件数 ≤ 阈值（默认 3，可配置）时逐个发送；否则打包 zip 当单文件发送；
+        打包失败或体积超限时降级为「本地路径 + 文件清单」。
+        返回给用户的收尾文本。"""
+        files = dl.get("files") or []
+        count = len(files)
+        folder_name = dl.get("name") or "未命名"
+        subject = label or f"文件夹 '{folder_name}'"
+        total_bytes = sum(int(f.get("size") or 0) for f in files)
+
+        # 文件少时逐个发送：原始文件更易命中 QQ 秒传（本地 zip 包哈希唯一，必然完整上传一遍）
+        threshold = self._get_send_files_threshold()
+        if 0 < count <= threshold:
+            sent = 0
+            for fd in files:
+                if await self._send_file(event, fd, share_url):
+                    sent += 1
+            if sent == count:
+                return f"✅ {subject} 下载完成，共 {count} 个文件已全部发送"
+            if sent > 0:
+                return (f"✅ {subject} 下载完成，共 {count} 个文件，"
+                        f"已发送 {sent} 个（其余发送失败），本地路径: {dl['path']}")
+
+        # 打包 zip 前先判断体积，避免压缩完才发现发不动（白占磁盘/耗时）
+        platform = getattr(event.platform_meta, "name", "") if event.platform_meta else ""
+        platform_id = getattr(event, "platform_identifier", "") or ""
+        is_official = (platform == "qq_official" or "qq_official" in platform_id
+                       or "qq_official" in platform or self._get_send_mode() == "official")
+        size_text = _format_size(str(total_bytes))
+        if is_official and total_bytes > FLASH_TASK_LIMIT_MB * 1024 * 1024:
+            return await self._folder_fallback(
+                event, dl, f"⚠️ 文件夹约 {size_text}，超过 QQ 官方 {FLASH_TASK_LIMIT_MB}MB 限制，未打包发送", subject)
+        zip_max_mb = self._get_zip_max_mb()
+        if zip_max_mb > 0 and total_bytes > zip_max_mb * 1024 * 1024:
+            return await self._folder_fallback(
+                event, dl, f"⚠️ 文件夹约 {size_text}，超过打包上限 {zip_max_mb}MB（配置 zip_max_size），未打包发送", subject)
+        # 打包需临时占用等量磁盘（zip 与原始文件并存），空间不足直接降级，避免压到一半失败
+        try:
+            free = shutil.disk_usage(PLUGIN_DATA_DIR).free
+            if free < total_bytes * 1.05:
+                return await self._folder_fallback(
+                    event, dl,
+                    f"⚠️ 打包需约 {_format_size(str(total_bytes))} 临时空间，当前可用 {_format_size(str(free))}，空间不足未打包",
+                    subject)
+        except Exception as e:
+            logger.warning(f"[BaiduPan] _send_folder: 磁盘空间检查失败: {e}")
+
+        safe_name = re.sub(r'[\\/:*?"<>|]+', "_", folder_name).strip() or "folder"
+        zip_name = f"{safe_name}.zip"
+        zip_path = os.path.join(PLUGIN_DATA_DIR, "zips", f"{safe_name}_{uuid.uuid4().hex[:8]}.zip")
+        z = await asyncio.to_thread(_zip_files, files, zip_path, folder_name)
+        if "error" in z:
+            return await self._folder_fallback(event, dl, f"⚠️ 打包失败（{z['error']}），未发送", subject)
+        logger.info(f"[BaiduPan] _send_folder: 打包完成 name={zip_name}, size={z['size']}, "
+                    f"stored={z.get('stored')}, deflated={z.get('deflated')}")
+        # 磁盘上用带随机后缀的唯一名（避免同名文件夹并发打包互相覆盖），发给用户时用干净名
+        z_send = dict(z, name=zip_name)
+        try:
+            sent_ok = await self._send_file(event, z_send, share_url)
+        finally:
+            # zip 是临时产物：发送结束后即清理（成功已送达 / 失败也发不动），避免堆积占盘
+            try:
+                os.remove(z["path"])
+            except OSError:
+                pass
+        if sent_ok:
+            return f"✅ {subject} 下载完成，已打包为 {zip_name} 发送（共 {count} 个文件）"
+        return await self._folder_fallback(event, dl, "⚠️ zip 发送失败，未发送", subject)
+
+    async def _folder_fallback(self, event: AstrMessageEvent, dl: dict, extra: str = "",
+                               label: str = "") -> str:
+        """文件夹无法直接发送时的降级输出：报完成 + 本地路径 + 文件清单。"""
+        files = dl.get("files") or []
+        subject = label or f"文件夹 '{dl.get('name') or '未命名'}'"
+        lines = [f"✅ {subject} 下载完成，共 {len(files)} 个文件"]
+        if extra:
+            lines.append(extra)
+        lines.append(f"📁 本地保存路径: {dl['path']}")
+        lines.append("📋 可用 /pan down <路径> 挑选下载，文件清单（最多显示 20 个）：")
+        for fd in files[:20]:
+            lines.append(f"• {fd.get('name')}（{_format_size(str(fd.get('size') or 0))}）")
+        if len(files) > 20:
+            lines.append(f"… 另有 {len(files) - 20} 个文件未显示")
+        text = "\n".join(lines)
+        await event.send(event.plain_result(text))
+        return text
+
     @filter.llm_tool(name="pan_list")
     async def pan_list(self, event: AstrMessageEvent, link: str, pwd: str = ""):
         """查看百度网盘分享链接的目录结构。用户说"查一下这个百度网盘链接"、"看看里面有什么文件"时调用。
@@ -1650,6 +1803,7 @@ class BaiduPanPlugin(Star):
         folder_path 必须与 pan_list 返回的目录树中显示的路径完全一致（从分享根目录第一层开始，如 "初中资料/2025万唯"），不要自创或省略层级。如果还没查看过目录树，先调用 pan_list。
         工具只转存选中项（需要网盘剩余空间大于该项大小）然后下载。若返回"空间不足"等错误，如实告诉用户原因，并建议挑选更小的文件/文件夹分批下载。
         下载完成后文件保存在本地下载目录（后台配置的 download_dir，未配置则为 AstrBot 插件数据目录 data/plugin_data 下的 downloads）下的 <账号uid_用户名>/ 子目录里，实际完整路径以工具返回值为准，回复用户时原样告知。
+        下载文件夹时插件会自动发送内容（文件数 ≤ 阈值（默认 3）时逐个发送，更多则打包 zip 发送）；若体积过大发不动，只返回本地路径与文件清单，此时如实告知用户并建议挑选更小的文件下载。
 
         Args:
             folder_path(string): 目录树中显示的文件夹或文件路径，如 "初中资料" 或 "初中资料/2025万唯"
@@ -1712,10 +1866,9 @@ class BaiduPanPlugin(Star):
                 return dl["error"]
 
             if dl.get("is_dir"):
-                file_count = len(dl.get("files", []))
-                await event.send(event.plain_result(f"✅ 文件夹 '{folder_path}' 下载完成，共 {file_count} 个文件"))
-                await event.send(event.plain_result(f"📁 保存路径: {dl['path']}"))
-                return f"文件夹 '{folder_path}' 下载完成，共 {file_count} 个文件，保存在 {dl['path']}"
+                # 文件夹不能直接发送：≤阈值逐个发，否则打包 zip，超限则降级为路径+清单
+                share_url = f"https://pan.baidu.com/s/{self._cached_surl}"
+                return await self._send_folder(event, dl, share_url)
             else:
                 share_url = f"https://pan.baidu.com/s/{self._cached_surl}"
                 sent = await self._send_file(event, dl, share_url)
@@ -1730,6 +1883,7 @@ class BaiduPanPlugin(Star):
         """下载百度网盘分享中的所有文件。用户说"全部下载"、"下载所有文件"、"都下载"时调用。
         注意：需要网盘剩余空间大于分享总大小；特大分享（TB级）会转存失败并返回空间不足提示，此时应引导用户改用 pan_download_dir 挑选需要的文件夹或文件分批下载。
         下载完成后文件保存在本地下载目录（后台配置的 download_dir）下的 <账号uid_用户名>/ 子目录里，实际完整路径以工具返回值为准，回复用户时原样告知。
+        下载完成后插件会自动发送内容（文件数 ≤ 阈值（默认 3）时逐个发送，更多则打包 zip 发送）；体积过大发不动时只返回本地路径与文件清单，此时如实告知用户。
 
         Args:
             link(string): 百度网盘分享链接（可选，如未查看过目录则需提供；也可传整段分享文案，会自动识别链接与提取码）
@@ -1782,10 +1936,9 @@ class BaiduPanPlugin(Star):
             if "error" in dl:
                 return dl["error"]
 
-            file_count = len(dl.get("files", []))
-            await event.send(event.plain_result(f"✅ 全部文件下载完成，共 {file_count} 个文件"))
-            await event.send(event.plain_result(f"📁 保存路径: {dl['path']}"))
-            return f"全部文件下载完成，共 {file_count} 个文件，保存在 {dl['path']}"
+            # 全部下载本质也是文件夹：≤阈值逐个发，否则打包 zip，超限则降级为路径+清单
+            share_url = f"https://pan.baidu.com/s/{self._cached_surl}"
+            return await self._send_folder(event, dl, share_url, label="全部文件")
         finally:
             self._active_downloads.discard(dl_key)
 
@@ -2061,8 +2214,7 @@ class BaiduPanPlugin(Star):
                 "/pan <链接> [密码]  查看目录树",
                 "💡 可直接粘贴整段分享文案（含“链接:”与“提取码:”），自动识别链接与提取码",
                 "/pan look  重新查看目录树",
-                "/pan dir <文件夹路径>  下载文件夹",
-                "/pan file <文件路径>  下载指定文件",
+                "/pan down <文件或文件夹路径>  下载文件夹或文件（自动识别类型）",
                 "/pan login  登录/退出统一入口（发送 /pan login 查看登录菜单）",
                 "/pan pcs  下载/更新 BaiduPCS-Go 工具（GitHub→国内镜像兜底）",
                 "/pan pcs git  强制直连 GitHub 官方原始链接（不用代理、不回退镜像）",
@@ -2163,16 +2315,16 @@ class BaiduPanPlugin(Star):
                 yield r
             return
 
-        if parts[0] in ("dir", "folder", "fl"):
-            # 下载文件夹（使用缓存的链接）
+        if parts[0] == "down":
+            # 下载文件夹或单个文件（自动识别类型）；使用缓存的链接
             if not self._cached_surl:
                 yield event.plain_result("请先使用 /pan <链接> [密码] 查看目录")
                 return
             if len(parts) < 2:
-                yield event.plain_result("用法: /pan dir <文件夹路径>")
+                yield event.plain_result("用法: /pan down <文件或文件夹路径>（自动识别类型）")
                 return
             # 路径可能含空格，拼回完整参数
-            dir_path = " ".join(parts[1:])
+            dl_path = " ".join(parts[1:])
             # 下载锁检查
             if dl_key in self._active_downloads:
                 logger.warning(f"[BaiduPan] on_pan: duplicate download blocked: {dl_key}")
@@ -2181,12 +2333,14 @@ class BaiduPanPlugin(Star):
             self._active_downloads.add(dl_key)
             _lock_acquired = True
             try:
-                logger.info(f"[BaiduPan] on_pan dir: dir_path={dir_path}, progress_enabled={self._progress_enabled}")
-                yield event.plain_result(f"⏳ 正在下载文件夹: {dir_path} ...")
-                tr = await asyncio.to_thread(self._ensure_transferred_sync, dir_path)
+                logger.info(f"[BaiduPan] on_pan down: dl_path={dl_path}, progress_enabled={self._progress_enabled}")
+                tr = await asyncio.to_thread(self._ensure_transferred_sync, dl_path)
                 if "error" in tr:
                     yield event.plain_result(f"❌ {tr['error']}")
                     return
+                # 自动识别类型（目录树已给出 is_dir）：下载前先告知用户是文件夹还是文件
+                kind = "文件夹" if tr.get("is_dir") else "文件"
+                yield event.plain_result(f"⏳ 正在下载{kind}: {dl_path} ...")
                 prog_q = queue.Queue() if self._progress_enabled else None
                 dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, tr["name"], self._get_max_mb(), prog_q))
                 if prog_q:
@@ -2239,103 +2393,17 @@ class BaiduPanPlugin(Star):
                                         _last_prog_time = now
                         await self._interruptible_sleep(dl_future, self._progress_interval)
                 dl = await dl_future
-                logger.info(f"[BaiduPan] on_pan dir: download complete, dl={dl}")
+                logger.info(f"[BaiduPan] on_pan down: download complete, dl={dl}")
                 if "error" in dl:
-                    logger.error(f"[BaiduPan] on_pan dir: download error: {dl['error']}")
+                    logger.error(f"[BaiduPan] on_pan down: download error: {dl['error']}")
                     yield event.plain_result(f"❌ {dl['error']}")
                 else:
                     if dl.get("is_dir"):
-                        yield event.plain_result(f"✅ 文件夹 '{dir_path}' 下载完成，共 {len(dl.get('files', []))} 个文件")
-                        yield event.plain_result(f"📁 保存路径: {dl['path']}")
+                        # 文件夹不能直接发送：≤阈值逐个发，否则打包 zip，超限则降级为路径+清单
+                        share_url = f"https://pan.baidu.com/s/{self._cached_surl}"
+                        yield event.plain_result(await self._send_folder(event, dl, share_url))
                     else:
                         yield event.chain_result([File(name=dl.get("name", "file"), file=dl["path"])])
-            finally:
-                if _lock_acquired:
-                    self._active_downloads.discard(dl_key)
-            return
-
-        if parts[0] in ("file", "f"):
-            # 下载文件（使用缓存的链接）
-            if not self._cached_surl:
-                yield event.plain_result("请先使用 /pan <链接> [密码] 查看目录")
-                return
-            if len(parts) < 2:
-                yield event.plain_result("用法: /pan file <文件路径>")
-                return
-            # 路径可能含空格，拼回完整参数
-            f_path = " ".join(parts[1:])
-            # 下载操作才加锁
-            if dl_key in self._active_downloads:
-                logger.warning(f"[BaiduPan] on_pan: duplicate download blocked: {dl_key}")
-                yield event.plain_result("⏳ 该文件正在下载中，请稍候...")
-                return
-            self._active_downloads.add(dl_key)
-            _lock_acquired = True
-            try:
-                logger.info(f"[BaiduPan] on_pan file: f_path={f_path}, progress_enabled={self._progress_enabled}")
-                yield event.plain_result(f"⏳ 正在下载文件: {f_path} ...")
-                tr = await asyncio.to_thread(self._ensure_transferred_sync, f_path)
-                if "error" in tr:
-                    yield event.plain_result(f"❌ {tr['error']}")
-                    return
-                prog_q = queue.Queue() if self._progress_enabled else None
-                dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, tr["name"], self._get_max_mb(), prog_q))
-                if prog_q:
-                    file_info = None
-                    _last_prog_size = None
-                    _last_prog_time = None
-                    while not dl_future.done():
-                        try:
-                            msg = prog_q.get_nowait()
-                            if isinstance(msg, tuple) and msg[0] == "_info":
-                                file_info = (msg[1], msg[2])
-                            elif isinstance(msg, tuple) and msg[0] == "_error":
-                                yield event.plain_result(f"❌ {msg[1]}")
-                            elif isinstance(msg, str):
-                                yield event.plain_result(msg)
-                        except queue.Empty:
-                            pass
-                        if file_info and not dl_future.done():
-                            fname, total = file_info
-                            current = _get_local_file_size(fname)
-                            # 如果 total==0 但本地文件有大小，用本地文件大小作为 total
-                            if total <= 0 and current > 0:
-                                total = current
-                                file_info = (fname, total)
-                            if current > 0 and total > 0:
-                                now = time.time()
-                                if _last_prog_time is None or now - _last_prog_time >= 1.0:
-                                    if _last_prog_size is not None and _last_prog_time is not None:
-                                        dt = now - _last_prog_time
-                                        if dt > 0:
-                                            speed_bps = (current - _last_prog_size) / dt
-                                            speed_str = f"{speed_bps/1024/1024:.2f} MB/s" if speed_bps >= 1024*1024 else f"{speed_bps/1024:.1f} KB/s"
-                                            remain = (total - current) / speed_bps if speed_bps > 0 else 0
-                                            if remain >= 3600:
-                                                eta = f"{remain/3600:.1f}h"
-                                            elif remain >= 60:
-                                                eta = f"{remain/60:.1f}m"
-                                            else:
-                                                eta = f"{remain:.0f}s"
-                                            _last_prog_size = current
-                                            _last_prog_time = now
-                                            pct = min(current / total * 100, 100.0)
-                                            yield event.plain_result(f"⏬ {pct:.1f}%  {speed_str}  ETA {eta}")
-                                            if current >= total:
-                                                yield event.plain_result("✅ 下载完成，正在发送...")
-                                                break
-                                    else:
-                                        _last_prog_size = current
-                                        _last_prog_time = now
-                        await self._interruptible_sleep(dl_future, self._progress_interval)
-                dl = await dl_future
-                logger.info(f"[BaiduPan] on_pan file: download complete, dl={dl}")
-                if "error" in dl:
-                    logger.error(f"[BaiduPan] on_pan file: download error: {dl['error']}")
-                    yield event.plain_result(f"❌ {dl['error']}")
-                else:
-                    logger.info(f"[BaiduPan] on_pan file: download complete, path={dl.get('path')}")
-                    yield event.chain_result([File(name=dl.get("name", "file"), file=dl["path"])])
             finally:
                 if _lock_acquired:
                     self._active_downloads.discard(dl_key)

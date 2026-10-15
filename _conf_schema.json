@@ -23,6 +23,18 @@
     "hint": "0 表示不限大小。填数字则限制在该大小内（官方模式下硬限200MB）",
     "default": 0
   },
+  "zip_max_size": {
+    "type": "int",
+    "description": "文件夹打包发送上限（MB），0=不限制",
+    "hint": "文件夹内文件数超过阈值时会打包 zip 发送；超过此大小则不打包（发不动还白占磁盘），改为返回本地路径+文件清单。默认 10240（10GB，对应 QQ 闪传大文件通道）",
+    "default": 10240
+  },
+  "send_files_threshold": {
+    "type": "int",
+    "description": "文件夹逐个发送的文件数阈值",
+    "hint": "文件夹内文件数 ≤ 此值时逐个发送原始文件（更易命中 QQ 秒传，无需完整上传）；超过则打包 zip 发送。0=总是打包。默认 3",
+    "default": 3
+  },
   "send_mode": {
     "type": "string",
     "description": "发送模式",
