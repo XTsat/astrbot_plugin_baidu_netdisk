@@ -33,13 +33,43 @@ BPCS_REPO = "qjfoidnh/BaiduPCS-Go"
 BPCS_API_URL = f"https://api.github.com/repos/{BPCS_REPO}/releases/latest"
 # 国内镜像直链（固定 v4.0.1，仅在 GitHub 不可达时兜底；不做哈希校验）
 BPCS_CN_URL = "https://www.now61.cn/f/0pb4TV/BaiduPCS-Go.exe"
+
+
+def _resolve_plugin_data_dir() -> str:
+    """解析 AstrBot 的 plugin-data 目录（data/plugin_data/<插件目录名>/）。
+    优先走官方 StarTools.get_data_dir()；兼容旧版 AstrBot 时回退到 astrbot_path 推导；
+    极端情况下回退到插件目录下的 plugin_data/。"""
+    plugin_dir_name = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        from astrbot.core.star.star_tools import StarTools
+        return str(StarTools.get_data_dir(plugin_dir_name))
+    except Exception:
+        pass
+    try:
+        import astrbot.core.utils.astrbot_path as _ap
+        d = os.path.join(_ap.get_astrbot_plugin_data_path(), plugin_dir_name)
+        os.makedirs(d, exist_ok=True)
+        return d
+    except Exception:
+        pass
+    d = os.path.join(os.path.dirname(__file__), "plugin_data")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+# 插件运行时数据（下载目录、下载清单、登录二维码）统一放 AstrBot 的 plugin-data
+# 目录（升级/重装插件本体不丢数据，卸载插件时 AstrBot 会连同清理）；
+# BaiduPCS-Go.exe 保留在插件目录，登录凭证 pcs_config.json 沿用 BaiduPCS-Go 默认位置（用户目录）
+PLUGIN_DATA_DIR = _resolve_plugin_data_dir()
+
+
 DOWNLOAD_DIR = None  # 初始化时根据配置设置
 CLOUD_SAVE_DIR = None  # 网盘转存目录
 FLASH_TASK_LIMIT_MB = 200
 DOWNLOAD_TIMEOUT_SECONDS = -1  # 下载超时秒数，-1 = 不超时（可在配置中修改）
 
 # 本插件下载过的本地文件清单，定时清理时只删这些，不动下载目录里的其他文件
-_MANIFEST_PATH = os.path.join(os.path.dirname(__file__), "storage", "cleanup_manifest.json")
+_MANIFEST_PATH = os.path.join(PLUGIN_DATA_DIR, "cleanup_manifest.json")
 
 _bpcs_inited = False
 _bpcs_lock = threading.Lock()
@@ -268,7 +298,8 @@ def _init_bpcs() -> bool:
 
 
 def _bpcs_config_path() -> str:
-    """BaiduPCS-Go 的 pcs_config.json 路径（支持 BAIDUPCS_GO_CONFIG_DIR 环境变量）。"""
+    """BaiduPCS-Go 的 pcs_config.json 路径（登录凭证，沿用 BaiduPCS-Go 默认位置；
+    支持 BAIDUPCS_GO_CONFIG_DIR 环境变量覆盖）。"""
     env = os.environ.get("BAIDUPCS_GO_CONFIG_DIR")
     if env:
         return os.path.join(env, "pcs_config.json")
@@ -1082,12 +1113,12 @@ class BaiduPanPlugin(Star):
         if custom_dir:
             DOWNLOAD_DIR = os.path.abspath(custom_dir)
         else:
-            DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "storage", "downloads")
+            DOWNLOAD_DIR = os.path.join(PLUGIN_DATA_DIR, "downloads")
         try:
             os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         except Exception as e:
             logger.warning(f"[BaiduPan] 配置的 download_dir ({DOWNLOAD_DIR}) 不可用 ({e})，回退到默认路径")
-            DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "storage", "downloads")
+            DOWNLOAD_DIR = os.path.join(PLUGIN_DATA_DIR, "downloads")
             os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         logger.info(f"[BaiduPan] download dir: {DOWNLOAD_DIR}")
 
@@ -1388,7 +1419,7 @@ class BaiduPanPlugin(Star):
         """下载百度网盘分享中的文件夹或单个文件。用户说"下载xxx文件夹"、"下载xxx里面的xxx文件夹"、"下载xxx这个文件"时调用。
         folder_path 必须与 pan_list 返回的目录树中显示的路径完全一致（从分享根目录第一层开始，如 "初中资料/2025万唯"），不要自创或省略层级。如果还没查看过目录树，先调用 pan_list。
         工具只转存选中项（需要网盘剩余空间大于该项大小）然后下载。若返回"空间不足"等错误，如实告诉用户原因，并建议挑选更小的文件/文件夹分批下载。
-        下载完成后文件保存在本地下载目录（后台配置的 download_dir，未配置则为插件目录 storage/downloads）下的 <账号uid_用户名>/ 子目录里，实际完整路径以工具返回值为准，回复用户时原样告知。
+        下载完成后文件保存在本地下载目录（后台配置的 download_dir，未配置则为 AstrBot 插件数据目录 data/plugin_data 下的 downloads）下的 <账号uid_用户名>/ 子目录里，实际完整路径以工具返回值为准，回复用户时原样告知。
 
         Args:
             folder_path(string): 目录树中显示的文件夹或文件路径，如 "初中资料" 或 "初中资料/2025万唯"
@@ -1756,7 +1787,7 @@ class BaiduPanPlugin(Star):
             except Exception as e:
                 yield event.plain_result(f"❌ 下载二维码失败: {e}")
                 return
-            qr_path = os.path.join(os.path.dirname(__file__), "storage", "qr_login.png")
+            qr_path = os.path.join(PLUGIN_DATA_DIR, "qr_login.png")
             os.makedirs(os.path.dirname(qr_path), exist_ok=True)
             with open(qr_path, "wb") as f:
                 f.write(img_r.content)

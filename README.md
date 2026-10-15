@@ -60,7 +60,7 @@
 | 最大下载大小（`max_file_size`） | int | 0 | 0=不限制；official 模式硬限 200MB |
 | 发送模式（`send_mode`） | string | onebot | onebot：napcat/SnowLuma；official：QQ 官方；other：其他平台 |
 | 用户黑名单（`blacklist`） | string | 空 | 多个 QQ 号用逗号分隔；仅 onebot 模式生效 |
-| 本地下载目录（`download_dir`） | string | 空 | 留空用插件目录下 `storage/downloads/` |
+| 本地下载目录（`download_dir`） | string | 空 | 留空用 AstrBot 插件数据目录 `data/plugin_data/astrbot_plugin_baidu_netdisk/downloads/` |
 | 网盘转存目录（`cloud_save_dir`） | string | 空 | 留空用默认 `/我的资源/AutoTransfer` |
 | 下载后自动删除转存（`auto_delete_cloud`） | bool | true | 文件下载并发送后删除网盘转存文件（回收站可找回） |
 | 本地定时清理（`local_cleanup_hour`） | int | 3 | 每天几点清理插件下载的本地文件（只清理本插件下载的；-1=关闭） |
@@ -96,6 +96,8 @@
 
 插件**不内置** BaiduPCS-Go.exe。**无需手动下载**：首次执行登录类命令（`/pan qrlogin`、`/pan login`、`/pan cookies`、`/pan bduss`，或配置 `bduuss` 启动自动登录）时会自动下载 GitHub 官方 **最新 release**（GitHub 不可达时自动回退国内镜像）；也可手动用 `/pan download` 下载/更新，文件损坏用同一命令修复，只走 GitHub 时用 `/pan download git`。
 
+> 数据存放：下载的文件、下载清单、登录二维码等运行时数据存放于 AstrBot 插件数据目录 `data/plugin_data/astrbot_plugin_baidu_netdisk/`（升级/重装插件不丢失）；登录凭证（`pcs_config.json`）沿用 BaiduPCS-Go 默认位置，保存在用户目录，不随插件数据清理。
+
 ### 安全声明
 
 - **不收集、不存储、不传输任何账号密码**，源码完全开源可审计
@@ -105,7 +107,7 @@
 ### 注意事项
 
 - 需登录百度网盘账号；会员账号可获得更高下载速度
-- 下载文件暂存于 `download_dir`（默认插件目录下 `storage/downloads/`），用 `local_cleanup_hour` 定时清理（只清理本插件下载的文件）
+- 下载文件暂存于 `download_dir`（默认 AstrBot 插件数据目录 `data/plugin_data/astrbot_plugin_baidu_netdisk/downloads/`），用 `local_cleanup_hour` 定时清理（只清理本插件下载的文件）
 - 下载完成默认自动删除网盘转存文件（回收站可找回），可关闭 `auto_delete_cloud`
 - 文件超过 `max_file_size` 限制时返回原分享链接
 - 网盘剩余空间不足时整包下载/转存会失败并明确提示，可改用 `/pan file <路径>` 或让 LLM 分批挑选

@@ -51,7 +51,7 @@
   "download_dir": {
     "type": "string",
     "description": "文件下载目录",
-    "hint": "留空则使用插件目录下 storage/downloads/",
+    "hint": "留空则使用 AstrBot 插件数据目录 data/plugin_data/astrbot_plugin_baidu_netdisk/downloads/",
     "default": ""
   },
   "cloud_save_dir": {
