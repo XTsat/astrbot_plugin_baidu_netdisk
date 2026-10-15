@@ -93,13 +93,13 @@
 
 ### BaiduPCS-Go
 
-插件**不内置** BaiduPCS-Go.exe，首次使用执行 `/pan download` 自动下载（国内镜像优先，失败自动回退 GitHub 官方 release；下载后校验 SHA256 与官方一致才使用）；文件损坏用同一命令修复，国内镜像失效时用 `/pan download git` 强制走 GitHub。
+插件**不内置** BaiduPCS-Go.exe，首次使用执行 `/pan download` 自动下载 GitHub 官方 **最新 release**（GitHub 不可达时自动回退国内镜像）；文件损坏用同一命令修复，只走 GitHub 时用 `/pan download git`。
 
 ### 安全声明
 
 - **不收集、不存储、不传输任何账号密码**，源码完全开源可审计
 - 主推扫码登录：密码根本不经过插件、机器人或任何第三方，登录凭证只保存在你自己的本机
-- BaiduPCS-Go 是第三方开源工具（[qjfoidnh/BaiduPCS-Go](https://github.com/qjfoidnh/BaiduPCS-Go)），本插件不打包任何二进制文件，exe 下载后校验 SHA256，与官方一致才使用
+- BaiduPCS-Go 是第三方开源工具（[qjfoidnh/BaiduPCS-Go](https://github.com/qjfoidnh/BaiduPCS-Go)），本插件不打包任何二进制文件，exe 从 GitHub 官方最新 release 下载，仅校验文件为有效 PE 程序
 
 ### 注意事项
 
