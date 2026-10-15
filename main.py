@@ -140,8 +140,17 @@ _exe_ok_cache = {"sig": None}  # 已验证可用的 exe 的 (mtime, size)，避�
 _cleanup_thread_started = False
 _share_switch_lock = threading.Lock()  # 串行化“切换分享链接”（rm 旧转存 + 转存新链接 + 更新缓存）
 _auto_dl_lock = threading.Lock()  # 串行化登录时的自动下载（同一时间只允许一个下载任务）
-_auto_dl_failed = False  # 自动下载失败缓存标记：避免 exe 缺失且网络不通时每次登录都长时间重试；/pan download 会重置
+_auto_dl_failed = False  # 自动下载失败缓存标记：避免 exe 缺失且网络不通时每次登录都长时间重试；/pan pcs 会重置
 _auto_dl_last_error = ""  # 最近一次自动下载失败的具体原因（GitHub/国内镜像各自的错误），用于给用户可诊断的失败提示
+# GitHub 加速代理（gh-proxy 类）：/pan pcs <代理地址> 保存后，下载与登录时自动下载都走该代理
+_GITHUB_PROXY_FILE = os.path.join(PLUGIN_DATA_DIR, "github_proxy.txt")
+_github_proxy = ""
+try:
+    _github_proxy = (open(_GITHUB_PROXY_FILE, "r", encoding="utf-8").read() or "").strip()
+except Exception:
+    pass
+if _github_proxy and not _github_proxy.lower().startswith(("http://", "https://")):
+    _github_proxy = ""
 
 
 def _ensure_bpcs_exe() -> bool:
@@ -172,7 +181,7 @@ def _auto_download_bpcs() -> bool:
     if _ensure_bpcs_exe():
         return True
     if _auto_dl_failed:
-        logger.warning("[BaiduPan] BaiduPCS-Go 不可用且此前自动下载失败，跳过自动下载（可用 /pan download 手动重试）")
+        logger.warning("[BaiduPan] BaiduPCS-Go 不可用且此前自动下载失败，跳过自动下载（可用 /pan pcs 手动重试）")
         return False
     with _auto_dl_lock:
         if _ensure_bpcs_exe():
@@ -200,18 +209,44 @@ def _auto_download_bpcs() -> bool:
         return _ensure_bpcs_exe()
 
 
-def _fetch_release_info() -> dict | None:
-    """从 GitHub API 获取官方 release 信息（下载 URL 和文件大小来自官方，不硬编码）。"""
-    headers = {"User-Agent": "astrbot_plugin_baidu_pan", "Accept": "application/vnd.github+json"}
+def _proxied_url(proxy: str, url: str) -> str:
+    """给 GitHub 请求地址加上加速代理前缀（gh-proxy 类代理：代理地址 + 原始完整 URL）。proxy 为空时原样返回。"""
+    if not proxy:
+        return url
+    return f"{proxy.rstrip('/')}/{url}"
+
+
+def _set_github_proxy(proxy: str) -> str | None:
+    """校验并持久化 GitHub 加速代理（供 /pan pcs <代理地址> 使用）。
+    成功返回 None，地址非法返回错误描述；写文件失败只记日志（本次会话仍生效）。"""
+    global _github_proxy
+    proxy = (proxy or "").strip().rstrip("/")
+    if not proxy.lower().startswith(("http://", "https://")):
+        return "代理地址必须以 http:// 或 https:// 开头"
+    _github_proxy = proxy
     try:
-        resp = _req.get(BPCS_API_URL, timeout=30, headers=headers)
+        os.makedirs(PLUGIN_DATA_DIR, exist_ok=True)
+        with open(_GITHUB_PROXY_FILE, "w", encoding="utf-8") as f:
+            f.write(proxy)
+    except Exception as e:
+        logger.warning(f"[BaiduPan] 保存 GitHub 加速代理失败（{e}），本次会话内仍生效")
+    return None
+
+
+def _fetch_release_info(proxy: str = "") -> dict | None:
+    """从 GitHub API 获取官方 release 信息（下载 URL 和文件大小来自官方，不硬编码）。
+    proxy 非空时通过加速代理访问 API（如 https://gh-proxy.org/https://api.github.com/...）。"""
+    headers = {"User-Agent": "astrbot_plugin_baidu_pan", "Accept": "application/vnd.github+json"}
+    api_url = _proxied_url(proxy, BPCS_API_URL)
+    try:
+        resp = _req.get(api_url, timeout=30, headers=headers)
         resp.raise_for_status()
         return resp.json()
     except _req.exceptions.SSLError:
         import urllib3 as _u3
         _u3.disable_warnings(_u3.exceptions.InsecureRequestWarning)
         try:
-            resp = _req.get(BPCS_API_URL, timeout=30, verify=False, headers=headers)
+            resp = _req.get(api_url, timeout=30, verify=False, headers=headers)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
@@ -262,11 +297,15 @@ def _download_cn_exe() -> dict:
         return {"error": f"写入 exe 失败: {e}"}
 
 
-def _download_github_exe(max_attempts: int = 3) -> dict:
+def _download_github_exe(proxy: str | None = None, max_attempts: int = 3) -> dict:
     """从 GitHub 官方 release 下载当前平台对应的最新版 BaiduPCS-Go（`/releases/latest`，不固定版本）。
     国内网络下 GitHub 下载经常瞬时失败（超时/连接重置/403），对可重试的失败自动重试，最多 max_attempts 次。
+    proxy 非空时把 API 与下载地址都加上加速代理前缀（如 https://gh-proxy.org/）；None/空串则直连。
     返回 {"ok": True} 或 {"error": "..."}。"""
     import zipfile as _zip, io as _io
+
+    if proxy is None:
+        proxy = _github_proxy
 
     def _get(url: str, timeout: int = 300) -> bytes | None:
         headers = {"User-Agent": "astrbot_plugin_baidu_pan"}
@@ -289,7 +328,7 @@ def _download_github_exe(max_attempts: int = 3) -> dict:
     suffix = _bpcs_asset_suffix()
     if not suffix:
         return {"error": f"当前平台（{sys.platform}/{platform.machine()}）暂不支持自动下载 BaiduPCS-Go，请手动获取对应平台的二进制"}
-    info = _fetch_release_info()
+    info = _fetch_release_info(proxy)
     if not info:
         return {"error": "GitHub 官方 release 获取失败，请检查网络后重试"}
     tag = info.get("tag_name", "latest")
@@ -303,13 +342,14 @@ def _download_github_exe(max_attempts: int = 3) -> dict:
     if not asset:
         names = [a.get("name", "") for a in info.get("assets", [])]
         return {"error": f"未在 release {tag} 中找到 {suffix} 的 zip 资产（现有: {names or '无'}）"}
-    download_url = asset["browser_download_url"]
+    download_url = _proxied_url(proxy, asset["browser_download_url"])
     expected_size = asset["size"]
     last_err = ""
     for attempt in range(1, max_attempts + 1):
         if attempt > 1:
             time.sleep(1.0 * (attempt - 1))  # 1s/2s 退避，给瞬时故障留恢复时间
-        logger.info(f"[BaiduPan] 从 GitHub 官方 release 下载 BaiduPCS-Go {tag}（{suffix}，第 {attempt}/{max_attempts} 次尝试）...")
+        via = f"通过加速代理 {proxy} " if proxy else ""
+        logger.info(f"[BaiduPan] {via}从 GitHub 官方 release 下载 BaiduPCS-Go {tag}（{suffix}，第 {attempt}/{max_attempts} 次尝试）...")
         data = _get(download_url, timeout=300)
         if data is None:
             last_err = "GitHub 下载失败（连接超时/被重置，请检查网络后重试）"
@@ -377,7 +417,7 @@ def _init_bpcs() -> bool:
         if _bpcs_inited:
             return True
         if not _ensure_bpcs_exe():
-            logger.warning(f"[BaiduPan] {_BPCS_EXE_NAME} 不可用，登录时会自动尝试下载，也可用 /pan download 手动下载")
+            logger.warning(f"[BaiduPan] {_BPCS_EXE_NAME} 不可用，登录时会自动尝试下载，也可用 /pan pcs 手动下载")
             return False
         out, _, code = _run_bpcs(["who"], timeout=15)
         if code == 0 and out and "登录" not in (out or "") and "未登录" not in (out or ""):
@@ -420,7 +460,7 @@ def login_bduss_bpcs(bduss: str, stoken: str = "") -> dict:
     """用 BDUSS + STOKEN 登录 BaiduPCS-Go。"""
     global _bpcs_inited
     if not _auto_download_bpcs():
-        return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或用 /pan download 手动下载）"}
+        return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或用 /pan pcs 手动下载）"}
     args = ["login", f"-bduss={bduss}"]
     if stoken:
         args.append(f"-stoken={stoken}")
@@ -463,7 +503,7 @@ def login_cookies_bpcs(cookie_str: str) -> dict:
     """用完整 Cookie 字符串登录 BaiduPCS-Go（v4.0.1 支持 -cookies 参数）。"""
     global _bpcs_inited
     if not _auto_download_bpcs():
-        return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或用 /pan download 手动下载）"}
+        return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或用 /pan pcs 手动下载）"}
     # 清洗：去掉可能干扰的空名项（如 =value）和 *_BFESS 字段
     cleaned = "; ".join(
         part.strip() for part in cookie_str.split(";")
@@ -492,7 +532,7 @@ def login_bpcs(username: str, password: str) -> dict:
     优先走交互式 stdin 输入，避免密码出现在进程命令行（同机其他进程可见）。"""
     global _bpcs_inited
     if not _auto_download_bpcs():
-        return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或用 /pan download 手动下载）"}
+        return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或用 /pan pcs 手动下载）"}
 
     # 方式一：交互式输入（密码不进命令行）
     try:
@@ -531,7 +571,7 @@ def logout_bpcs() -> dict:
     """退出 BaiduPCS-Go 当前登录的百度帐号，清除本地凭证。"""
     global _bpcs_inited
     if not _auto_download_bpcs():
-        return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或用 /pan download 手动下载）"}
+        return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或用 /pan pcs 手动下载）"}
     out, err, code = _run_bpcs(["logout", "-y"], timeout=30)
     text = (out or "") + chr(10) + (err or "")
     if code == 0:
@@ -1104,7 +1144,7 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
             snippet = ((out or "").strip().splitlines() or ["(无输出)"])[0][:100]
             if code == -2:
                 return {"error": f"{_BPCS_EXE_NAME} 不可用或无法执行（{(out or '')[:80]}）。"
-                                 f"请先确保已通过 /pan download 下载工具"}
+                                 f"请先确保已通过 /pan pcs 下载工具"}
             if code == -1:
                 return {"error": f"查询网盘目录超时: {cloud_path}"}
             return {"error": f"网盘中不存在该路径或查询失败: {cloud_path}（{snippet}）"}
@@ -2021,8 +2061,10 @@ class BaiduPanPlugin(Star):
                 "/pan dir <文件夹路径>  下载文件夹",
                 "/pan file <文件路径>  下载指定文件",
                 "/pan login  登录/退出统一入口（发送 /pan login 查看登录菜单）",
-                "/pan download  下载/更新 BaiduPCS-Go 工具",
-                "/pan download git  强制从 GitHub 下载（出问题时用）",
+                "/pan pcs  下载/更新 BaiduPCS-Go 工具（GitHub→国内镜像兜底）",
+                "/pan pcs git  强制直连 GitHub 官方原始链接（不用代理、不回退镜像）",
+                "/pan pcs <代理URL>  通过加速代理下载并保存（如 https://gh-proxy.org/）",
+                "/pan pcs off  清除已保存的加速代理",
             ]
             yield event.plain_result("\n".join(help_lines))
             sponsor_path = os.path.join(os.path.dirname(__file__), "sponsor.png")
@@ -2033,25 +2075,53 @@ class BaiduPanPlugin(Star):
                 ])
             return
 
-        if parts[0] == "download":
-            global _auto_dl_failed
+        if parts[0].lower() == "pcs":
+            global _auto_dl_failed, _github_proxy
             _auto_dl_failed = False  # 手动下载即重试自动下载标记
-            if len(parts) > 1 and parts[1] == "git":
-                # 强制只走 GitHub 官方 release，不回退国内镜像
-                yield event.plain_result("⏳ 正在从 GitHub 官方 release 下载最新版 BaiduPCS-Go...")
-                result = await asyncio.to_thread(_download_github_exe)
-                if "ok" in result:
-                    yield event.plain_result(f"✅ {_BPCS_EXE_NAME} 下载成功！现在可以使用 /pan login 等命令了。")
+            if len(parts) > 1:
+                arg2 = parts[1]
+                if arg2 == "git":
+                    # 强制只走 GitHub 官方原始链接直连：不用代理、不回退国内镜像
+                    yield event.plain_result("⏳ 正在从 GitHub 官方 release 直连下载最新版 BaiduPCS-Go...")
+                    result = await asyncio.to_thread(_download_github_exe, "")
+                    if "ok" in result:
+                        yield event.plain_result(f"✅ {_BPCS_EXE_NAME} 下载成功！现在可以使用 /pan login 等命令了。")
+                    else:
+                        yield event.plain_result(
+                            f"❌ 下载失败: {result.get('error', '未知错误')}\n"
+                            "💡 网络不通时可改用 /pan pcs <加速代理地址> 通过代理下载，例如 /pan pcs https://gh-proxy.org/"
+                        )
+                    return
+                if arg2.lower() == "off":
+                    # 清除已保存的加速代理，回到默认下载方式
+                    _github_proxy = ""
+                    try:
+                        os.remove(_GITHUB_PROXY_FILE)
+                    except OSError:
+                        pass
+                    yield event.plain_result("🗑️ 已清除 GitHub 加速代理，恢复默认下载方式（GitHub→国内镜像兜底）。")
+                elif arg2.lower().startswith(("http://", "https://")):
+                    # 保存并走指定加速代理下载
+                    set_err = _set_github_proxy(arg2)
+                    if set_err:
+                        yield event.plain_result(f"❌ {set_err}")
+                        return
                 else:
-                    yield event.plain_result(f"❌ 下载失败: {result.get('error', '未知错误')}")
-                return
-            # 第一步：GitHub 官方 latest release（最新版本）
-            yield event.plain_result("⏳ 正在从 GitHub 官方 release 下载最新版 BaiduPCS-Go...")
+                    yield event.plain_result("用法: /pan pcs [git|off|<加速代理地址>]")
+                    yield event.plain_result("  /pan pcs              下载/更新工具（GitHub→国内镜像兜底）")
+                    yield event.plain_result("  /pan pcs git          强制直连 GitHub 官方原始链接（不回退国内镜像）")
+                    yield event.plain_result("  /pan pcs <代理地址>   通过加速代理下载并保存（如 https://gh-proxy.org/，登录时自动下载也生效）")
+                    yield event.plain_result("  /pan pcs off          清除已保存的加速代理")
+                    return
+            # 默认流程：GitHub 官方 latest release（有已保存代理则走代理），失败回退国内镜像
+            via = f"加速代理 {_github_proxy} " if _github_proxy else ""
+            yield event.plain_result(f"⏳ 正在{via}从 GitHub 官方 release 下载最新版 BaiduPCS-Go...")
             result = await asyncio.to_thread(_download_github_exe)
             if "ok" in result:
-                yield event.plain_result(f"✅ {_BPCS_EXE_NAME} 下载成功！现在可以使用 /pan login 等命令了。")
+                saved = " 加速代理已保存，登录时自动下载也会使用。" if _github_proxy else ""
+                yield event.plain_result(f"✅ {_BPCS_EXE_NAME} 下载成功！现在可以使用 /pan login 等命令了。{saved}")
                 return
-            # 第二步：GitHub 失败，回退国内镜像（固定 v4.0.1 兜底）
+            # GitHub 失败，回退国内镜像（固定 v4.0.1 兜底）
             yield event.plain_result(f"⏳ GitHub 下载失败（{result.get('error', '未知原因')}），正在从国内镜像下载...")
             result = await asyncio.to_thread(_download_cn_exe)
             if "ok" in result:
@@ -2074,7 +2144,7 @@ class BaiduPanPlugin(Star):
             if not await asyncio.to_thread(_auto_download_bpcs):
                 yield event.plain_result(
                     f"❌ BaiduPCS-Go 自动下载失败：{_auto_dl_last_error or '未知原因'}。"
-                    "请稍后重试（或用 /pan download 手动下载）"
+                    "请稍后重试（或用 /pan pcs 手动下载）"
                 )
                 return
 

@@ -8,6 +8,7 @@
 - **登录时自动下载 BaiduPCS-Go**：首次使用登录类命令时，插件会自行下载所需工具
 
 ### 变更
+- **`/pan pcs` 取代 `/pan download`，并支持加速代理**：国内访问 GitHub 慢时可用 `/pan pcs <代理地址>`（如 `https://gh-proxy.org/`）走加速代理下载，地址会被记住、之后登录时的自动下载也走代理，`/pan pcs off` 清除
 - **登录指令统一为 `/pan login`**：支持数字简写（`1` 扫码、`2` 账密、`3` BDUSS、`4` Cookie、`0` 退出）与完整写法（`qr` / `pwd` / `bduss` / `cookies` / `out`）；直接发 `/pan login` 可查看登录菜单
 - **支持 Linux / macOS（Docker 部署）**：此前只下载 Windows 版工具，在 Linux / macOS 上必然不可用；现在会自动匹配当前系统与架构
 - **数据不再随插件升级丢失**：下载目录与登录相关数据改存 AstrBot 数据目录，升级或重装插件后仍然保留
