@@ -697,10 +697,64 @@ def _share_api_preflight(sess, surl: str, pwd: str, share_link: str) -> dict:
             "short": surl[1:] if surl.startswith("1") else surl}
 
 
+def _api_dir_list_errno(sess, bdstoken: str, dir_path: str) -> int:
+    """查询自己网盘目录是否存在（errno: 0=存在, -9=不存在, 其他=异常）。"""
+    try:
+        r = sess.get(
+            "https://pan.baidu.com/api/list",
+            params={"app_id": "250528", "bdstoken": bdstoken, "dir": dir_path,
+                    "order": "name", "desc": "0", "showempty": "0", "web": "1",
+                    "page": "1", "num": "1"},
+            headers={"Referer": "https://pan.baidu.com/disk/main"}, timeout=15)
+        return int(r.json().get("errno", -1))
+    except Exception as e:
+        logger.warning(f"[BaiduPan] api/list 检查目录 {dir_path} 失败: {e}")
+        return -1
+
+
+def _ensure_remote_dir(sess, bdstoken: str, target_path: str) -> str:
+    """逐级确保转存目标目录存在（纯 API，不依赖 BaiduPCS-Go）。
+
+    百度 share/transfer 对不存在的目标目录返回 errno=2「转存路径不存在」，
+    新账号/首次使用时网盘里根本没有 /我的资源/AutoTransfer，转存必然失败。
+    这里按 /a/b/c 逐级 list 确认、缺失则 api/create 创建。
+    注意 api/create 对「已存在」的目录不会报错而是自动改名（errno=0），
+    所以必须先 list 确认再创建，避免重复创建出带时间戳后缀的目录。
+
+    返回 "" 表示成功，否则返回错误描述。"""
+    parts = [p for p in str(target_path).strip("/").split("/") if p]
+    cur = ""
+    for p in parts:
+        cur = f"{cur}/{p}"
+        errno = _api_dir_list_errno(sess, bdstoken, cur)
+        if errno == 0:
+            continue
+        if errno != -9:
+            return f"检查网盘目录 {cur} 失败(errno={errno})"
+        try:
+            r = sess.post(
+                "https://pan.baidu.com/api/create",
+                params={"app_id": "250528", "bdstoken": bdstoken},
+                data={"path": cur, "isdir": "1", "block_list": "[]"},
+                headers={"Referer": "https://pan.baidu.com/disk/main",
+                         "Content-Type": "application/x-www-form-urlencoded"},
+                timeout=20).json()
+        except Exception as e:
+            logger.warning(f"[BaiduPan] 创建网盘目录 {cur} 失败: {e}")
+            return f"创建网盘目录 {cur} 失败: {e}"
+        if r.get("errno") != 0:
+            show = r.get("show_msg") or r.get("errno")
+            logger.warning(f"[BaiduPan] 创建网盘目录 {cur} 失败: {show}")
+            return f"创建网盘目录 {cur} 失败(errno={show})"
+        logger.info(f"[BaiduPan] 已自动创建网盘转存目录: {cur}")
+    return ""
+
+
 def _transfer_via_api(surl: str, pwd: str, target_path: str, fs_ids: list = None) -> dict:
     """用 Python requests 直接调用百度网盘 API，把指定的 fs_id 列表转存到 target_path。
     fs_ids 为 None 时转存分享根目录的全部文件。
     替代 BaiduPCS-Go 的 transfer 命令（v4.0.1 有 cookie 传递 bug）。
+    转存前会自动逐级创建 target_path（新账号网盘里可能还没有该目录）。
 
     返回: {"success": True, "filenames": [...], "fs_ids": [...]}
           或 {"error": "错误信息"}
@@ -740,6 +794,12 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str, fs_ids: list = None
             filenames = [f.get("server_filename") for f in files]
             logger.info(f"[BaiduPan] transfer files: {filenames}")
 
+        # Step 4.5: 确保转存目标目录存在（新账号/首次使用网盘里通常还没有该目录，
+        # 缺失时 share/transfer 返回 errno=2「转存路径不存在」导致下载误报「路径不存在」）
+        mkdir_err = _ensure_remote_dir(sess, bdstoken, target_path)
+        if mkdir_err:
+            return {"error": mkdir_err}
+
         # Step 5: 执行转存
         transfer_url = (
             f"https://pan.baidu.com/share/transfer"
@@ -759,13 +819,22 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str, fs_ids: list = None
         if errno == 0:
             logger.info(f"[BaiduPan] transfer success: {filenames}")
             return {"success": True, "filenames": filenames, "fs_ids": fs_ids}
-        elif errno in (2, 4):
-            # errno=2: 自己的分享链接无法重复转存
-            # errno=4: 文件已转存过，目录里已有这些文件
-            # 两种情况文件都在云端，可以正常列出和下载
-            own = (errno == 2)
-            logger.info(f"[BaiduPan] transfer errno={errno} (already exists), filenames={filenames}")
-            return {"success": True, "filenames": filenames, "fs_ids": fs_ids, "_own_share": own}
+        elif errno == 2:
+            # errno=2 是「转存路径不存在」（目标目录缺失，目录已在 Step 4.5 自动创建，
+            # 若仍返回 2 说明目录创建失败）；旧版本把它误判为「自己的分享/已转存过」
+            # 直接放行，导致后续下载报误导性的「路径不存在」。此处如实报错。
+            # 注：百度对「不能转存自己的分享」也可能返回 errno=2。
+            show = (resp5.get("show_msg") or "").strip()
+            logger.warning(f"[BaiduPan] transfer errno=2, show_msg={show or '(空)'}")
+            if "路径不存在" in show or "不存在" in show:
+                return {"error": f"转存失败：目标目录 {target_path} 创建失败或不存在（{show}）"}
+            return {"error": f"转存失败(errno=2): {show or '不能转存自己的分享（同一账号限制）'}。"
+                             f"若是你自己的分享，请从网盘原目录下载，或换一个非本人的网盘账号登录"}
+        elif errno == 4:
+            # errno=4: 目标目录里已有这些文件（之前转存过/重复转存），
+            # duplicated 列表中的文件就是云端已存在的目标文件，可以直接继续下载
+            logger.info(f"[BaiduPan] transfer errno=4 (already exists), filenames={filenames}")
+            return {"success": True, "filenames": filenames, "fs_ids": fs_ids}
         elif errno == 12:
             # 按 info 里的具体 errno 区分：-30 同名已存在 / -32 空间不足
             info = resp5.get("info", []) or []
@@ -1032,7 +1101,13 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
         parent = norm.rsplit("/", 1)[0] if "/" in norm else "/"
         out, _, code = _run_bpcs(["ls", "-l", parent], timeout=60)
         if code != 0 or "错误" in (out or "") or "不存在" in (out or ""):
-            return {"error": f"路径不存在: {cloud_path}"}
+            snippet = ((out or "").strip().splitlines() or ["(无输出)"])[0][:100]
+            if code == -2:
+                return {"error": f"{_BPCS_EXE_NAME} 不可用或无法执行（{(out or '')[:80]}）。"
+                                 f"请先确保已通过 /pan download 下载工具"}
+            if code == -1:
+                return {"error": f"查询网盘目录超时: {cloud_path}"}
+            return {"error": f"网盘中不存在该路径或查询失败: {cloud_path}（{snippet}）"}
         found = None
         for line in out.split("\n"):
             parsed = _parse_ls_line(line)
@@ -1080,10 +1155,14 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE
         )
+        # 预写一个 y 应答（防个别 BPCS 版本仍弹覆盖确认），但**不要手动 close stdin**：
+        # Python 3.12 的 communicate() 会对已关闭的 stdin 做内部 flush，
+        # 抛 ValueError「flush of closed file」导致每次下载都失败。
+        # stdin 的关闭交给 communicate() 统一处理（写入结束后子进程自然读到 EOF）。
         try:
             proc.stdin.write(b"y\n")
-            proc.stdin.close()
-        except (BrokenPipeError, OSError):
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
             pass  # 进程可能已退出，communicate 会给出结果
         if dl_timeout > 0:
             out = proc.communicate(timeout=dl_timeout)[0]
