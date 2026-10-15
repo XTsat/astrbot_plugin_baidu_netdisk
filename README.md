@@ -96,7 +96,7 @@
 
 插件**不内置** BaiduPCS-Go（Windows 下为 `BaiduPCS-Go.exe`，Linux/macOS 下为无扩展名的 `BaiduPCS-Go`）。**无需手动下载**：首次执行登录类命令（`/pan qrlogin`、`/pan login`、`/pan cookies`、`/pan bduss`，或配置 `bduuss` 启动自动登录）时会自动下载 GitHub 官方 **最新 release** 中**当前平台对应**的二进制（Windows / Linux / macOS，x64 / arm64 自动匹配；GitHub 不可达时自动回退国内镜像，**国内镜像仅提供 Windows 版**），保存在**插件目录**下；也可手动用 `/pan download` 下载/更新，文件损坏用同一命令修复，只走 GitHub 时用 `/pan download git`。
 
-> 数据存放：下载的文件、下载清单、登录二维码等运行时数据存放于 AstrBot 插件数据目录 `data/plugin_data/astrbot_plugin_baidu_netdisk/`（升级/重装插件不丢失）；登录凭证（`pcs_config.json`）沿用 BaiduPCS-Go 默认位置，保存在用户目录，不随插件数据清理。
+> 数据存放：下载的文件、下载清单、登录二维码等运行时数据存放于 AstrBot 插件数据目录 `data/plugin_data/astrbot_plugin_baidu_netdisk/`（升级/重装插件不丢失）；登录凭证（`pcs_config.json`）沿用 BaiduPCS-Go 默认位置（Windows: `%APPDATA%/BaiduPCS-Go/`，Linux/macOS: `~/.config/BaiduPCS-Go/`；若**插件目录**（exe 同目录）已存在 `pcs_config.json`，BaiduPCS-Go 与插件都会自动优先使用它，也可用 `BAIDUPCS_GO_CONFIG_DIR` 环境变量显式指定），不随插件数据清理。
 
 ### 安全声明
 
@@ -114,6 +114,7 @@
 - 分享链接在百度侧失效（打开报 500 或「链接出错」）时插件会明确报错，需分享者重新分享
 - napcat 闪传存在已知 BUG（Issue #2015），大文件闪传可能失败并降级为返回链接
 - QQ 官方机器人模式超 200MB 会在下载前直接拦截并返回链接
+- **Docker 部署**：登录凭证默认在容器内 `~/.config/BaiduPCS-Go/`（不在 AstrBot 的 data 卷上），重建容器会丢失登录态、需重新扫码；**推荐把 `pcs_config.json` 放到插件目录**（BaiduPCS-Go 与插件会自动优先使用 exe 同目录的配置），插件目录本身在 `data/plugins/` 卷上，重建容器/升级插件都不丢登录态；也可把 `~/.config/BaiduPCS-Go` 挂载为数据卷，或用 `BAIDUPCS_GO_CONFIG_DIR` 环境变量指向持久化目录
 
 ### 项目信息
 

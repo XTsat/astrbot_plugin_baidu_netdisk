@@ -4,4 +4,6 @@ __pycache__/
 *.pyc
 test_*.txt
 qr_test.png
+BaiduPCS-Go
 BaiduPCS-Go.exe
+pcs_config.json

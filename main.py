@@ -115,7 +115,9 @@ def _resolve_plugin_data_dir() -> str:
 
 # 插件运行时数据（下载目录、下载清单、登录二维码）统一放 AstrBot 的 plugin-data
 # 目录（升级/重装插件本体不丢数据，卸载插件时 AstrBot 会连同清理）；
-# BaiduPCS-Go.exe 保留在插件目录，登录凭证 pcs_config.json 沿用 BaiduPCS-Go 默认位置（用户目录）
+# BaiduPCS-Go 二进制保留在插件目录，登录凭证 pcs_config.json 沿用 BaiduPCS-Go 默认位置
+# （Windows: %APPDATA%/BaiduPCS-Go，Linux/macOS: ~/.config/BaiduPCS-Go，支持
+#  BAIDUPCS_GO_CONFIG_DIR 环境变量覆盖；完整解析逻辑见 _bpcs_config_path）
 PLUGIN_DATA_DIR = _resolve_plugin_data_dir()
 
 
@@ -387,14 +389,31 @@ def _init_bpcs() -> bool:
 
 
 def _bpcs_config_path() -> str:
-    """BaiduPCS-Go 的 pcs_config.json 路径（登录凭证，沿用 BaiduPCS-Go 默认位置；
-    支持 BAIDUPCS_GO_CONFIG_DIR 环境变量覆盖）。"""
+    """BaiduPCS-Go 的 pcs_config.json 路径（登录凭证，沿用 BaiduPCS-Go 默认位置）。
+
+    与 BaiduPCS-Go 源码 GetConfigDir() 保持一致：
+      - BAIDUPCS_GO_CONFIG_DIR 环境变量（绝对路径直接用，相对路径以 exe 所在目录为基准）
+      - exe 同目录已存在旧版 pcs_config.json 时沿用旧位置
+      - Windows: %APPDATA%/BaiduPCS-Go
+      - Linux/macOS: ~/.config/BaiduPCS-Go
+      - 上述都不可用时回退到 exe 同目录"""
+    exe_dir = os.path.dirname(os.path.abspath(BPCS_PATH))
     env = os.environ.get("BAIDUPCS_GO_CONFIG_DIR")
     if env:
-        return os.path.join(env, "pcs_config.json")
-    return os.path.join(
-        os.path.expanduser("~"), "AppData", "Roaming", "BaiduPCS-Go", "pcs_config.json"
-    )
+        base = env if os.path.isabs(env) else os.path.join(exe_dir, env)
+        return os.path.join(base, "pcs_config.json")
+    # 旧版行为：exe 同目录已存在 pcs_config.json 时沿用，避免切换路径后丢登录态
+    if os.path.exists(os.path.join(exe_dir, "pcs_config.json")):
+        return os.path.join(exe_dir, "pcs_config.json")
+    if _IS_WINDOWS:
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return os.path.join(appdata, "BaiduPCS-Go", "pcs_config.json")
+        return os.path.join(exe_dir, "pcs_config.json")  # APPDATA 缺失时落到程序目录
+    home = os.path.expanduser("~")
+    if home and home != "~":
+        return os.path.join(home, ".config", "BaiduPCS-Go", "pcs_config.json")
+    return os.path.join(exe_dir, "pcs_config.json")  # HOME 缺失时落到程序目录
 
 
 def login_bduss_bpcs(bduss: str, stoken: str = "") -> dict:
