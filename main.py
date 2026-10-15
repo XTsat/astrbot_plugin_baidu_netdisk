@@ -972,19 +972,36 @@ def _schedule_local_cleanup(hour: int):
     logger.info(f"[BaiduPan] scheduled local cleanup at {hour}:00 daily")
 
 
+# 从任意文本（含整段中文分享文案）中提取分享链接与提取码
+# 链接形式：pan.baidu.com/s/xxx、pan.baidu.com/share/init?surl=xxx、yun.baidu.com/s/xxx（可无协议头）
+_SHARE_SURL_RE = re.compile(
+    r'(?:https?://)?(?:[A-Za-z0-9-]+\.)*baidu\.com/(?:s/|share/init\?(?:surl|shorturl)=)'
+    r'([A-Za-z0-9_-]+)',
+    re.IGNORECASE,
+)
+# 提取码形式：pwd=xxxx / 提取码:xxxx / 提取码：xxxx / 密码  xxxx / 访问码:xxxx（支持半角与全角冒号）
+_PWD_RE = re.compile(
+    r'(?<![A-Za-z0-9])(?:pwd|password|提取码|密码|访问码)\s*[:：=]?\s*([A-Za-z0-9]{4,6})',
+    re.IGNORECASE,
+)
+
+
 def parse_share_link(link: str) -> tuple:
-    link = link.strip().replace("\\", "")
-    if "baidu.com/link" in link or "url=" in link:
-        link = urllib.parse.unquote(link)
+    """从任意文本中提取百度网盘分享的 (surl, 提取码)。支持：
+    - 完整链接（含 ?pwd=xxx）、裸 surl
+    - 整段中文分享文案，如：
+      "通过百度网盘分享的文件：xxx.zip 链接:https://pan.baidu.com/s/1abc123?pwd=abcd 复制这段内容…"
+      "通过百度网盘分享的文件：xxx.zip 链接:https://pan.baidu.com/s/1abc123 提取码:abcd 复制这段内容…"
+    找不到链接时 surl 返回空串。"""
+    text = (link or "").strip().replace("\\", "")
+    if "baidu.com/link" in text or "url=" in text:
+        text = urllib.parse.unquote(text)
     surl = ""
-    pwd = ""
-    m = re.search(r'pan\.baidu\.com/s/([A-Za-z0-9_-]+)', link)
+    m = _SHARE_SURL_RE.search(text)
     if m:
         surl = m.group(1)
-    m = re.search(r'baidu\.com/s/([A-Za-z0-9_-]+)', link)
-    if m and not surl:
-        surl = m.group(1)
-    m = re.search(r'(?:pwd|password|提取码)[:\s=]*([A-Za-z0-9]{4,6})', link, re.IGNORECASE)
+    pwd = ""
+    m = _PWD_RE.search(text)
     if m:
         pwd = m.group(1).strip()
     return surl, pwd
@@ -1468,43 +1485,29 @@ class BaiduPanPlugin(Star):
 
     @staticmethod
     def _normalize_link(link: str, pwd: str) -> tuple:
-        """把用户输入的链接/surl 规范化为 (surl, pwd)。支持：
-        完整链接(含?pwd=)、链接+空格提取码、裸surl、裸surl + 提取码(空格分隔或"提取码:"前缀)。"""
-        link = (link or "").strip()
-        if link.startswith(("http", "pan.baidu.com", "yun.baidu.com")):
-            if not link.startswith("http"):
-                link = "https://" + link
-            # 链接后可能跟了空格分隔的提取码（命令参数拼接，如"链接 052x"/"链接 提取码:052x"）
-            seg = link.split(None, 1)
-            if len(seg) > 1:
-                m = re.search(
-                    r'(?:(?:pwd|password|提取码)\s*[:：=]?\s*)?([A-Za-z0-9]{4,6})\s*$',
-                    seg[1].strip(), re.IGNORECASE)
-                if m and not pwd:
-                    pwd = m.group(1)
-                link = seg[0]
-            surl, p2 = parse_share_link(link)
-            return surl, (p2 or pwd)
-        # 裸 surl：取第一段，剩余部分尝试提取密码
-        seg = link.split(None, 1)
-        surl = seg[0]
-        rest = seg[1].strip() if len(seg) > 1 else ""
-        if "?" in surl:  # 裸 surl 带查询串，如 1abc?pwd=052x
-            surl, query = surl.split("?", 1)
-            if not pwd:
-                m2 = re.search(r'(?:^|[&\s])(?:pwd|password|提取码)[:\s=]*([A-Za-z0-9]{4,6})',
-                               query, re.IGNORECASE)
-                if m2:
-                    pwd = m2.group(1)
-        if not pwd and rest:
-            m = re.search(r'(?:pwd|password|提取码)[:\s=]*([A-Za-z0-9]{4,6})', rest, re.IGNORECASE)
-            if m:
-                pwd = m.group(1)
-            else:
+        """把用户输入规范化为 (surl, pwd)。支持：
+        完整链接(含?pwd=)、链接+空格提取码、整段中文分享文案（"链接:xxx 提取码:xxx"）、
+        裸surl、裸surl + 提取码(空格分隔或"提取码:"前缀)。文本中显式标注的提取码优先。"""
+        text = (link or "").strip()
+        surl, text_pwd = parse_share_link(text)
+        if not text_pwd:
+            # 链接/裸surl 之后空格分隔的纯提取码（如 "链接 052x"）
+            seg = text.split(None, 1)
+            rest = seg[1].strip() if len(seg) > 1 else ""
+            if rest:
                 first = rest.split()[0]
                 if re.fullmatch(r'[A-Za-z0-9]{4,6}', first):
-                    pwd = first
-        return surl, pwd
+                    text_pwd = first
+        if surl:
+            return surl, (text_pwd or pwd)
+        # 没有可识别的链接：按裸 surl 处理（取第一段，去掉查询串）
+        seg = text.split(None, 1)
+        first = seg[0] if seg else ""
+        if "?" in first:  # 裸 surl 带查询串，如 1abc?pwd=052x
+            first = first.split("?", 1)[0]
+        if re.fullmatch(r'[A-Za-z0-9_-]{4,}', first):
+            return first, (text_pwd or pwd)
+        return "", (text_pwd or pwd)
 
     @staticmethod
     async def _interruptible_sleep(fut: asyncio.Future, seconds: int):
@@ -1619,7 +1622,7 @@ class BaiduPanPlugin(Star):
         超大目录树最多展示3层/约300项，超出部分会在末尾提示；下载更深层的内容时把已知路径传给下载工具即可。
 
         Args:
-            link(string): 百度网盘分享链接，如 https://pan.baidu.com/s/1abc123
+            link(string): 百度网盘分享链接，如 https://pan.baidu.com/s/1abc123（也可直接传用户发来的整段分享文案，会自动识别链接与提取码）
             pwd(string): 提取码（可选）
         """
         if self._is_blacklisted(event):
@@ -1650,7 +1653,7 @@ class BaiduPanPlugin(Star):
 
         Args:
             folder_path(string): 目录树中显示的文件夹或文件路径，如 "初中资料" 或 "初中资料/2025万唯"
-            link(string): 百度网盘分享链接（可选，如未查看过目录则需提供）
+            link(string): 百度网盘分享链接（可选，如未查看过目录则需提供；也可传整段分享文案，会自动识别链接与提取码）
             pwd(string): 提取码（可选）
         """
         if self._is_blacklisted(event):
@@ -1729,7 +1732,7 @@ class BaiduPanPlugin(Star):
         下载完成后文件保存在本地下载目录（后台配置的 download_dir）下的 <账号uid_用户名>/ 子目录里，实际完整路径以工具返回值为准，回复用户时原样告知。
 
         Args:
-            link(string): 百度网盘分享链接（可选，如未查看过目录则需提供）
+            link(string): 百度网盘分享链接（可选，如未查看过目录则需提供；也可传整段分享文案，会自动识别链接与提取码）
             pwd(string): 提取码（可选）
         """
         if self._is_blacklisted(event):
@@ -1793,7 +1796,7 @@ class BaiduPanPlugin(Star):
         转存结果在网盘的暂存目录（默认 /我的资源/AutoTransfer）下，回复用户时把转存到的网盘路径一起告诉用户。
 
         Args:
-            link(string): 百度网盘分享链接（可选，如未查看过目录则需提供）
+            link(string): 百度网盘分享链接（可选，如未查看过目录则需提供；也可传整段分享文案，会自动识别链接与提取码）
             pwd(string): 提取码（可选）
             path(string): 要转存的文件夹或文件在目录树中的路径（可选，不传则转存全部）
         """
@@ -2056,7 +2059,7 @@ class BaiduPanPlugin(Star):
             help_lines = [
                 "用法:",
                 "/pan <链接> [密码]  查看目录树",
-                "/pan ls [链接] [密码]  查看目录树（不下载文件，无参数重看缓存）",
+                "💡 可直接粘贴整段分享文案（含“链接:”与“提取码:”），自动识别链接与提取码",
                 "/pan look  重新查看目录树",
                 "/pan dir <文件夹路径>  下载文件夹",
                 "/pan file <文件路径>  下载指定文件",
@@ -2153,31 +2156,6 @@ class BaiduPanPlugin(Star):
                 yield event.plain_result(self._cached_tree)
             else:
                 yield event.plain_result("请先使用 /pan <链接> [密码] 查看目录")
-            return
-
-        if parts[0] == "ls":
-            # 查看分享目录树（不下载文件）：/pan ls [链接 [提取码]]
-            if len(parts) >= 2:
-                surl, pwd2 = self._normalize_link(" ".join(parts[1:]), "")
-                if not surl:
-                    yield event.plain_result("❌ 无法解析链接")
-                    return
-                blocked = self._check_switch_allowed(surl)
-                if blocked:
-                    yield event.plain_result(f"❌ {blocked}")
-                    return
-                yield event.plain_result("⏳ 正在获取目录结构...")
-                result = await asyncio.to_thread(self._transfer_and_list, surl, pwd2)
-                if "error" in result:
-                    yield event.plain_result(f"❌ {result['error']}")
-                else:
-                    yield event.plain_result(result["text"])
-                return
-            # 无参数：重看缓存的目录树
-            if self._cached_tree:
-                yield event.plain_result(self._cached_tree)
-            else:
-                yield event.plain_result("请先使用 /pan ls <链接> [密码] 查看目录")
             return
 
         if parts[0] == "login":
