@@ -6,9 +6,11 @@ then send via AstrBot's platform adapters.
 """
 import asyncio
 import os
+import platform
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -27,12 +29,66 @@ try:
 except ImportError:  # 兼容旧版 AstrBot
     from astrbot.core.message.message_event_result import MessageChain
 
-BPCS_PATH = os.path.join(os.path.dirname(__file__), "BaiduPCS-Go.exe")
+# 平台检测：BaiduPCS-Go 按当前系统下载对应平台的二进制（Windows: exe；Linux/macOS: 无扩展名可执行文件）
+_IS_WINDOWS = sys.platform.startswith("win")
+_IS_MACOS = sys.platform == "darwin"
+_IS_LINUX = sys.platform.startswith("linux")
+_BPCS_EXE_NAME = "BaiduPCS-Go.exe" if _IS_WINDOWS else "BaiduPCS-Go"
+BPCS_PATH = os.path.join(os.path.dirname(__file__), _BPCS_EXE_NAME)
 # BaiduPCS-Go 官方 release 信息：始终拉取 GitHub 最新 release（不固定版本号/资产名，下载 URL 与大小由 API 实时提供）
 BPCS_REPO = "qjfoidnh/BaiduPCS-Go"
 BPCS_API_URL = f"https://api.github.com/repos/{BPCS_REPO}/releases/latest"
-# 国内镜像直链（固定 v4.0.1，仅在 GitHub 不可达时兜底；不做哈希校验）
+# 国内镜像直链（固定 v4.0.1，仅在 GitHub 不可达时兜底；不做哈希校验；镜像仅提供 Windows 版）
 BPCS_CN_URL = "https://www.now61.cn/f/0pb4TV/BaiduPCS-Go.exe"
+
+
+def _bpcs_asset_suffix() -> str | None:
+    """当前平台对应的 GitHub release 资产后缀（如 linux-amd64 / windows-x64 / darwin-osx-arm64）。
+    不支持的平台返回 None。"""
+    machine = platform.machine().lower()
+    if _IS_WINDOWS:
+        if machine in ("amd64", "x86_64"):
+            return "windows-x64"
+        if machine in ("arm64", "aarch64"):
+            return "windows-arm64"
+        return "windows-x86"  # 32 位 x86 兜底
+    if _IS_LINUX:
+        if machine in ("amd64", "x86_64"):
+            return "linux-amd64"
+        if machine in ("arm64", "aarch64"):
+            return "linux-arm64"
+        if machine.startswith("armv7") or machine.startswith("arm"):
+            return "linux-arm"
+        return None
+    if _IS_MACOS:
+        if machine in ("amd64", "x86_64"):
+            return "darwin-osx-amd64"
+        if machine in ("arm64", "aarch64"):
+            return "darwin-osx-arm64"
+        return None
+    return None
+
+
+def _sanity_check_binary(data: bytes, what: str = "下载的文件") -> str | None:
+    """按平台校验可执行文件格式（Windows: PE/MZ；macOS: Mach-O；Linux: ELF），
+    避免把错误页/损坏文件写成本地二进制。合法返回 None，非法返回错误描述。"""
+    if not data or len(data) < 4:
+        return f"{what}过小（{len(data)} 字节），疑似损坏"
+    if _IS_WINDOWS:
+        if data[:2] != b"MZ":
+            return f"{what}不是有效的 Windows PE 程序"
+        return None
+    if _IS_MACOS:
+        if data[:4] not in (
+            b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf",  # Mach-O 32/64 位（大端）
+            b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe",  # Mach-O 64 位（小端）/ Universal
+            b"\xca\xfe\xba\xbf",
+        ):
+            return f"{what}不是有效的 macOS 可执行文件"
+        return None
+    if data[:4] != b"\x7fELF":
+        return f"{what}不是有效的 Linux ELF 程序"
+    return None
 
 
 def _resolve_plugin_data_dir() -> str:
@@ -83,10 +139,12 @@ _cleanup_thread_started = False
 _share_switch_lock = threading.Lock()  # 串行化“切换分享链接”（rm 旧转存 + 转存新链接 + 更新缓存）
 _auto_dl_lock = threading.Lock()  # 串行化登录时的自动下载（同一时间只允许一个下载任务）
 _auto_dl_failed = False  # 自动下载失败缓存标记：避免 exe 缺失且网络不通时每次登录都长时间重试；/pan download 会重置
+_auto_dl_last_error = ""  # 最近一次自动下载失败的具体原因（GitHub/国内镜像各自的错误），用于给用户可诊断的失败提示
 
 
 def _ensure_bpcs_exe() -> bool:
-    """检查 BaiduPCS-Go.exe 是否存在且可运行。不存在或损坏时返回 False。结果按文件签名缓存。"""
+    """检查 BaiduPCS-Go 二进制是否存在且可运行（Windows 为 .exe，Linux/macOS 无扩展名）。
+    不存在或损坏时返回 False。结果按文件签名缓存。"""
     try:
         st = os.stat(BPCS_PATH)
     except OSError:
@@ -106,8 +164,9 @@ def _ensure_bpcs_exe() -> bool:
 
 def _auto_download_bpcs() -> bool:
     """确保 BaiduPCS-Go 可用：缺失或损坏时自动下载（GitHub 官方 release 优先，国内镜像兜底）。
-    并发安全（同一时间只允许一个下载任务）；下载失败会缓存标记，避免每次登录都长时间重试。"""
-    global _auto_dl_failed
+    并发安全（同一时间只允许一个下载任务）；下载失败会缓存标记，避免每次登录都长时间重试；
+    失败原因记录到 _auto_dl_last_error 供用户侧提示。"""
+    global _auto_dl_failed, _auto_dl_last_error
     if _ensure_bpcs_exe():
         return True
     if _auto_dl_failed:
@@ -120,14 +179,22 @@ def _auto_download_bpcs() -> bool:
             return False
         logger.info("[BaiduPan] BaiduPCS-Go 不存在或不可用，开始自动下载...")
         result = _download_github_exe()
+        gh_err = result["error"] if "error" in result else ""
         if "error" in result:
             logger.warning(f"[BaiduPan] GitHub 自动下载失败，回退国内镜像: {result['error']}")
             result = _download_cn_exe()
         if "error" in result:
             _auto_dl_failed = True
-            logger.error(f"[BaiduPan] BaiduPCS-Go 自动下载失败: {result['error']}")
+            _auto_dl_last_error = "；".join(
+                part for part in (
+                    f"GitHub: {gh_err}" if gh_err else "",
+                    f"国内镜像: {result['error']}",
+                ) if part
+            )
+            logger.error(f"[BaiduPan] BaiduPCS-Go 自动下载失败: {_auto_dl_last_error}")
             return False
         _auto_dl_failed = False
+        _auto_dl_last_error = ""
         return _ensure_bpcs_exe()
 
 
@@ -154,8 +221,10 @@ def _fetch_release_info() -> dict | None:
 
 
 def _download_cn_exe() -> dict:
-    """仅尝试从国内镜像直链下载 BaiduPCS-Go.exe（固定 v4.0.1，兜底用）。
+    """仅尝试从国内镜像直链下载 BaiduPCS-Go（固定 v4.0.1，兜底用；**镜像仅提供 Windows 版**）。
     返回 {"ok": True} 或 {"error": "..."}。"""
+    if not _IS_WINDOWS:
+        return {"error": "国内镜像仅提供 Windows 版 BaiduPCS-Go，当前平台请从 GitHub 官方 release 下载"}
     def _get(url: str, timeout: int = 300) -> bytes | None:
         headers = {"User-Agent": "astrbot_plugin_baidu_pan"}
         try:
@@ -178,9 +247,10 @@ def _download_cn_exe() -> dict:
     data = _get(BPCS_CN_URL, timeout=120)
     if data is None:
         return {"error": "国内镜像下载失败（网络不可达）"}
-    # 不做哈希校验，仅检查 PE 头，避免把错误页/损坏文件写成本地 exe
-    if len(data) < 2 or data[:2] != b"MZ":
-        return {"error": "国内镜像下载的文件不是有效的 PE 程序"}
+    # 不做哈希校验，仅按平台校验二进制格式，避免把错误页/损坏文件写成本地 exe
+    err = _sanity_check_binary(data, "国内镜像下载的文件")
+    if err:
+        return {"error": err}
     try:
         with open(BPCS_PATH, "wb") as f:
             f.write(data)
@@ -190,8 +260,9 @@ def _download_cn_exe() -> dict:
         return {"error": f"写入 exe 失败: {e}"}
 
 
-def _download_github_exe() -> dict:
-    """从 GitHub 官方 release 下载最新版 BaiduPCS-Go（`/releases/latest`，不固定版本）。
+def _download_github_exe(max_attempts: int = 3) -> dict:
+    """从 GitHub 官方 release 下载当前平台对应的最新版 BaiduPCS-Go（`/releases/latest`，不固定版本）。
+    国内网络下 GitHub 下载经常瞬时失败（超时/连接重置/403），对可重试的失败自动重试，最多 max_attempts 次。
     返回 {"ok": True} 或 {"error": "..."}。"""
     import zipfile as _zip, io as _io
 
@@ -213,55 +284,73 @@ def _download_github_exe() -> dict:
         except Exception:
             return None
 
+    suffix = _bpcs_asset_suffix()
+    if not suffix:
+        return {"error": f"当前平台（{sys.platform}/{platform.machine()}）暂不支持自动下载 BaiduPCS-Go，请手动获取对应平台的二进制"}
     info = _fetch_release_info()
     if not info:
         return {"error": "GitHub 官方 release 获取失败，请检查网络后重试"}
     tag = info.get("tag_name", "latest")
-    logger.info(f"[BaiduPan] 从 GitHub 官方 release 下载 BaiduPCS-Go {tag}...")
-    # 资产名含版本号（如 BaiduPCS-Go-v4.0.2-windows-x64.zip），按命名规则动态匹配，不硬编码
+    # 资产名含版本号（如 BaiduPCS-Go-v4.0.2-linux-amd64.zip），按命名规则 + 平台后缀动态匹配，不硬编码
     asset = None
     for a in info.get("assets", []):
         name = a.get("name", "")
-        if name.startswith("BaiduPCS-Go-") and name.endswith("-windows-x64.zip"):
+        if name.startswith("BaiduPCS-Go-") and name.endswith(f"-{suffix}.zip"):
             asset = a
             break
     if not asset:
         names = [a.get("name", "") for a in info.get("assets", [])]
-        return {"error": f"未在 release {tag} 中找到 windows-x64 的 zip 资产（现有: {names or '无'}）"}
+        return {"error": f"未在 release {tag} 中找到 {suffix} 的 zip 资产（现有: {names or '无'}）"}
     download_url = asset["browser_download_url"]
     expected_size = asset["size"]
-    data = _get(download_url, timeout=300)
-    if data is None:
-        return {"error": "GitHub 下载失败，请检查网络后重试"}
-    if len(data) != expected_size:
-        return {"error": f"下载大小不匹配: 官方API={expected_size}, 实际={len(data)}"}
-    try:
-        with _zip.ZipFile(_io.BytesIO(data)) as zf:
-            exe_name = None
-            for n in zf.namelist():
-                if os.path.basename(n).lower() == "baidupcs-go.exe":
-                    exe_name = n
-                    break
-            if not exe_name:
-                for n in zf.namelist():
-                    if n.lower().endswith(".exe"):
-                        exe_name = n
-                        break
-            if not exe_name:
-                return {"error": "压缩包内未找到 BaiduPCS-Go.exe"}
-            exe_data = zf.read(exe_name)
-    except Exception as e:
-        return {"error": f"解压失败: {e}"}
-    # 不做哈希校验，仅检查 PE 头，避免把损坏文件写成本地 exe
-    if len(exe_data) < 2 or exe_data[:2] != b"MZ":
-        return {"error": "解压出的文件不是有效的 PE 程序"}
-    try:
-        with open(BPCS_PATH, "wb") as f:
-            f.write(exe_data)
-        logger.info(f"[BaiduPan] GitHub 下载成功（{len(exe_data)} bytes, {tag}）")
-        return {"ok": True}
-    except Exception as e:
-        return {"error": f"写入 exe 失败: {e}"}
+    last_err = ""
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            time.sleep(1.0 * (attempt - 1))  # 1s/2s 退避，给瞬时故障留恢复时间
+        logger.info(f"[BaiduPan] 从 GitHub 官方 release 下载 BaiduPCS-Go {tag}（{suffix}，第 {attempt}/{max_attempts} 次尝试）...")
+        data = _get(download_url, timeout=300)
+        if data is None:
+            last_err = "GitHub 下载失败（连接超时/被重置，请检查网络后重试）"
+            continue
+        if len(data) != expected_size:
+            last_err = f"下载大小不匹配: 官方API={expected_size}, 实际={len(data)}"
+            continue
+        try:
+            with _zip.ZipFile(_io.BytesIO(data)) as zf:
+                files = [n for n in zf.namelist() if not n.endswith("/")]
+                exe_name = next((n for n in files if os.path.basename(n).lower() == _BPCS_EXE_NAME.lower()), None)
+                if not exe_name:
+                    if _IS_WINDOWS:
+                        exe_name = next((n for n in files if n.lower().endswith(".exe")), None)
+                    else:
+                        exe_name = next(
+                            (n for n in files
+                             if os.path.basename(n).lower().startswith("baidupcs-go")
+                             and not os.path.basename(n).lower().endswith((".md", ".txt", ".yml", ".yaml", ".json", ".log"))),
+                            None,
+                        )
+                if not exe_name:
+                    last_err = f"压缩包内未找到 {_BPCS_EXE_NAME}"
+                    continue
+                exe_data = zf.read(exe_name)
+        except Exception as e:
+            last_err = f"解压失败: {e}"
+            continue
+        # 不做哈希校验，仅按平台校验可执行文件格式，避免把损坏文件/错误页写成本地二进制
+        err = _sanity_check_binary(exe_data, "解压出的文件")
+        if err:
+            last_err = err
+            continue
+        try:
+            with open(BPCS_PATH, "wb") as f:
+                f.write(exe_data)
+            if not _IS_WINDOWS:
+                os.chmod(BPCS_PATH, 0o755)  # zip 不保留可执行位，POSIX 需手动加上
+            logger.info(f"[BaiduPan] GitHub 下载成功（{len(exe_data)} bytes, {tag}, {suffix}）")
+            return {"ok": True}
+        except Exception as e:
+            return {"error": f"写入 exe 失败: {e}"}  # 写盘失败重试无意义，直接返回
+    return {"error": last_err or "GitHub 下载失败，请检查网络后重试"}
 
 
 def _run_bpcs(args: list, timeout: int = 300) -> tuple:
@@ -286,7 +375,7 @@ def _init_bpcs() -> bool:
         if _bpcs_inited:
             return True
         if not _ensure_bpcs_exe():
-            logger.warning("[BaiduPan] BaiduPCS-Go.exe 不可用，登录时会自动尝试下载，也可用 /pan download 手动下载")
+            logger.warning(f"[BaiduPan] {_BPCS_EXE_NAME} 不可用，登录时会自动尝试下载，也可用 /pan download 手动下载")
             return False
         out, _, code = _run_bpcs(["who"], timeout=15)
         if code == 0 and out and "登录" not in (out or "") and "未登录" not in (out or ""):
@@ -312,7 +401,7 @@ def login_bduss_bpcs(bduss: str, stoken: str = "") -> dict:
     """用 BDUSS + STOKEN 登录 BaiduPCS-Go。"""
     global _bpcs_inited
     if not _auto_download_bpcs():
-        return {"error": "BaiduPCS-Go.exe 不可用且自动下载失败，请稍后重试（或用 /pan download 手动下载）"}
+        return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或用 /pan download 手动下载）"}
     args = ["login", f"-bduss={bduss}"]
     if stoken:
         args.append(f"-stoken={stoken}")
@@ -355,7 +444,7 @@ def login_cookies_bpcs(cookie_str: str) -> dict:
     """用完整 Cookie 字符串登录 BaiduPCS-Go（v4.0.1 支持 -cookies 参数）。"""
     global _bpcs_inited
     if not _auto_download_bpcs():
-        return {"error": "BaiduPCS-Go.exe 不可用且自动下载失败，请稍后重试（或用 /pan download 手动下载）"}
+        return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或用 /pan download 手动下载）"}
     # 清洗：去掉可能干扰的空名项（如 =value）和 *_BFESS 字段
     cleaned = "; ".join(
         part.strip() for part in cookie_str.split(";")
@@ -384,7 +473,7 @@ def login_bpcs(username: str, password: str) -> dict:
     优先走交互式 stdin 输入，避免密码出现在进程命令行（同机其他进程可见）。"""
     global _bpcs_inited
     if not _auto_download_bpcs():
-        return {"error": "BaiduPCS-Go.exe 不可用且自动下载失败，请稍后重试（或用 /pan download 手动下载）"}
+        return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或用 /pan download 手动下载）"}
 
     # 方式一：交互式输入（密码不进命令行）
     try:
@@ -423,7 +512,7 @@ def logout_bpcs() -> dict:
     """退出 BaiduPCS-Go 当前登录的百度帐号，清除本地凭证。"""
     global _bpcs_inited
     if not _auto_download_bpcs():
-        return {"error": "BaiduPCS-Go.exe 不可用且自动下载失败，请稍后重试（或用 /pan download 手动下载）"}
+        return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或用 /pan download 手动下载）"}
     out, err, code = _run_bpcs(["logout", "-y"], timeout=30)
     text = (out or "") + chr(10) + (err or "")
     if code == 0:
@@ -1142,7 +1231,7 @@ class BaiduPanPlugin(Star):
         if _ensure_bpcs_exe():
             _run_bpcs(["config", "set", "-savedir", DOWNLOAD_DIR], timeout=15)
         else:
-            logger.warning("[BaiduPan] BaiduPCS-Go.exe 不可用，首次登录时会自动下载，配置将在下载后生效")
+            logger.warning(f"[BaiduPan] {_BPCS_EXE_NAME} 不可用，首次登录时会自动下载，配置将在下载后生效")
 
         # 解析黑名单
         bl = str(self.config.get("blacklist", "")).strip()
@@ -1654,7 +1743,7 @@ class BaiduPanPlugin(Star):
                 yield event.plain_result("⏳ 正在从 GitHub 官方 release 下载最新版 BaiduPCS-Go...")
                 result = await asyncio.to_thread(_download_github_exe)
                 if "ok" in result:
-                    yield event.plain_result("✅ BaiduPCS-Go.exe 下载成功！现在可以使用 /pan login 等命令了。")
+                    yield event.plain_result(f"✅ {_BPCS_EXE_NAME} 下载成功！现在可以使用 /pan login 等命令了。")
                 else:
                     yield event.plain_result(f"❌ 下载失败: {result.get('error', '未知错误')}")
                 return
@@ -1662,13 +1751,13 @@ class BaiduPanPlugin(Star):
             yield event.plain_result("⏳ 正在从 GitHub 官方 release 下载最新版 BaiduPCS-Go...")
             result = await asyncio.to_thread(_download_github_exe)
             if "ok" in result:
-                yield event.plain_result("✅ BaiduPCS-Go.exe 下载成功！现在可以使用 /pan login 等命令了。")
+                yield event.plain_result(f"✅ {_BPCS_EXE_NAME} 下载成功！现在可以使用 /pan login 等命令了。")
                 return
             # 第二步：GitHub 失败，回退国内镜像（固定 v4.0.1 兜底）
-            yield event.plain_result("⏳ GitHub 下载失败，正在从国内镜像下载...")
+            yield event.plain_result(f"⏳ GitHub 下载失败（{result.get('error', '未知原因')}），正在从国内镜像下载...")
             result = await asyncio.to_thread(_download_cn_exe)
             if "ok" in result:
-                yield event.plain_result("✅ BaiduPCS-Go.exe 下载成功！现在可以使用 /pan login 等命令了。")
+                yield event.plain_result(f"✅ {_BPCS_EXE_NAME} 下载成功！现在可以使用 /pan login 等命令了。")
             else:
                 yield event.plain_result(f"❌ 下载失败: {result.get('error', '未知错误')}")
             return
@@ -1676,11 +1765,14 @@ class BaiduPanPlugin(Star):
         # 以下命令都需要 BaiduPCS-Go.exe；登录类命令在 exe 缺失/损坏时自动下载
         if not _ensure_bpcs_exe():
             if parts[0] not in ("qrlogin", "login", "cookies", "bduss", "unlogin"):
-                yield event.plain_result("❌ BaiduPCS-Go.exe 缺失或损坏，请使用 /pan help 中提供的命令进行下载或查看readme")
+                yield event.plain_result(f"❌ {_BPCS_EXE_NAME} 缺失或损坏，请使用 /pan help 中提供的命令进行下载或查看readme")
                 return
             yield event.plain_result("⏳ BaiduPCS-Go 不存在或不可用，正在自动下载（GitHub 官方 release 优先，失败回退国内镜像）...")
             if not await asyncio.to_thread(_auto_download_bpcs):
-                yield event.plain_result("❌ BaiduPCS-Go 自动下载失败，请稍后重试（或用 /pan download 手动下载）")
+                yield event.plain_result(
+                    f"❌ BaiduPCS-Go 自动下载失败：{_auto_dl_last_error or '未知原因'}。"
+                    "请稍后重试（或用 /pan download 手动下载）"
+                )
                 return
 
         if parts[0] == "look":

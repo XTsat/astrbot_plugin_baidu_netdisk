@@ -94,7 +94,7 @@
 
 ### BaiduPCS-Go
 
-插件**不内置** BaiduPCS-Go.exe。**无需手动下载**：首次执行登录类命令（`/pan qrlogin`、`/pan login`、`/pan cookies`、`/pan bduss`，或配置 `bduuss` 启动自动登录）时会自动下载 GitHub 官方 **最新 release**（GitHub 不可达时自动回退国内镜像）；也可手动用 `/pan download` 下载/更新，文件损坏用同一命令修复，只走 GitHub 时用 `/pan download git`。
+插件**不内置** BaiduPCS-Go（Windows 下为 `BaiduPCS-Go.exe`，Linux/macOS 下为无扩展名的 `BaiduPCS-Go`）。**无需手动下载**：首次执行登录类命令（`/pan qrlogin`、`/pan login`、`/pan cookies`、`/pan bduss`，或配置 `bduuss` 启动自动登录）时会自动下载 GitHub 官方 **最新 release** 中**当前平台对应**的二进制（Windows / Linux / macOS，x64 / arm64 自动匹配；GitHub 不可达时自动回退国内镜像，**国内镜像仅提供 Windows 版**），保存在**插件目录**下；也可手动用 `/pan download` 下载/更新，文件损坏用同一命令修复，只走 GitHub 时用 `/pan download git`。
 
 > 数据存放：下载的文件、下载清单、登录二维码等运行时数据存放于 AstrBot 插件数据目录 `data/plugin_data/astrbot_plugin_baidu_netdisk/`（升级/重装插件不丢失）；登录凭证（`pcs_config.json`）沿用 BaiduPCS-Go 默认位置，保存在用户目录，不随插件数据清理。
 
@@ -102,7 +102,7 @@
 
 - **不收集、不存储、不传输任何账号密码**，源码完全开源可审计
 - 主推扫码登录：密码根本不经过插件、机器人或任何第三方，登录凭证只保存在你自己的本机
-- BaiduPCS-Go 是第三方开源工具（[qjfoidnh/BaiduPCS-Go](https://github.com/qjfoidnh/BaiduPCS-Go)），本插件不打包任何二进制文件，exe 从 GitHub 官方最新 release 下载，仅校验文件为有效 PE 程序
+- BaiduPCS-Go 是第三方开源工具（[qjfoidnh/BaiduPCS-Go](https://github.com/qjfoidnh/BaiduPCS-Go)），本插件不打包任何二进制文件，二进制从 GitHub 官方最新 release 按平台下载，下载后校验文件格式（Windows: PE；Linux: ELF；macOS: Mach-O）
 
 ### 注意事项
 
