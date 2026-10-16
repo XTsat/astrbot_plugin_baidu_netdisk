@@ -7,8 +7,10 @@ qr_test.png
 BaiduPCS-Go
 BaiduPCS-Go.exe
 pcs_config.json
-plugin_data/          # 数据目录回退路径就在插件目录内（非标准部署时会产生）
-*.tmp                 # 原子写入的中间文件
+# 数据目录回退路径就在插件目录内（非标准部署时会产生）
+plugin_data/
+# 原子写入的中间文件
+*.tmp
 .venv/
 venv/
 *.log
