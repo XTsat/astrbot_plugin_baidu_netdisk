@@ -106,8 +106,9 @@
 - 以下登录/退出命令**仅管理员可用**（账号为全群共用，普通用户只需要用 `/pan`、`/pan down` 下载）
 - **扫码登录（推荐）**：发送 `/pan login 1`（或 `/pan login qr`），用百度网盘 APP 扫码确认，全程无需输入账号密码；二维码 3 分钟有效，登录状态重启 AstrBot 后仍然有效
 - **账密登录**：`/pan login 2 <账号> <密码>`（或 `/pan login pwd <账号> <密码>`），建议私聊执行并用后撤回消息；百度风控可能返回 50052，此时改用扫码或 BDUSS
-- **BDUSS 登录**：浏览器 F12 → Application → Cookies 复制 BDUSS（和 STOKEN）后发送 `/pan login 3 <BDUSS> [STOKEN]`（或 `/pan login bduss <BDUSS> [STOKEN]`）
-- **Cookie 登录**：浏览器 F12 → Network → 任意请求 → 复制 Cookie 请求头后发送 `/pan login 4 <完整Cookies>`（或 `/pan login cookies <完整Cookies>`）
+- **BDUSS 登录**：浏览器 F12 → Application → Cookies 复制 BDUSS（和 STOKEN）后发送 `/pan login 3 <BDUSS> [STOKEN]`（或 `/pan login bduss <BDUSS> [STOKEN]`），**请私聊执行并用后撤回消息**（BDUSS 等同于账号密码，会留在聊天记录里）
+- **Cookie 登录**：浏览器 F12 → Network → 任意请求 → 复制 Cookie 请求头后发送 `/pan login 4 <完整Cookies>`（或 `/pan login cookies <完整Cookies>`），同样**请私聊执行并用后撤回消息**
+- BDUSS / Cookie 登录时凭证不再经过命令行参数，系统进程列表中不会出现你的凭证（非私聊执行时插件会先提醒撤回消息）
 - **退出登录**：发送 `/pan login 0`（或 `/pan login out`）
 - 记不住方式？发送 `/pan login` 即可查看完整登录菜单，所有方式都支持数字简写与完整指令两种输入
 

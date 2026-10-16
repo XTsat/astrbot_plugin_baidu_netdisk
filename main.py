@@ -252,11 +252,14 @@ class _DownloadGuard:
 _FILE_WRITE_LOCK = threading.Lock()  # 写入方可能在下载工作线程里，故用线程锁而非 asyncio.Lock
 
 
-def _atomic_write(path: str, text: str) -> None:
+def _atomic_write(path: str, text: str, mode: int | None = None) -> None:
     """原子写入文本：先写同目录的 .tmp，再 os.replace 覆盖目标文件。
 
     直接 open(..., "w") 会先把原文件截断再逐块写：进程在写入途中被中断（重启、OOM）
-    就会留下半个文件，下次读取直接解析失败。"""
+    就会留下半个文件，下次读取直接解析失败。
+
+    mode 非空时给临时文件设权限再 replace：os.replace 会把临时文件的权限带到目标文件上，
+    而 open() 新建临时文件走的是 umask（通常 0644），用它覆盖 0600 的凭证文件等于降权。"""
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
     tmp = f"{path}.tmp"
@@ -266,6 +269,8 @@ def _atomic_write(path: str, text: str) -> None:
                 f.write(text)
                 f.flush()
                 os.fsync(f.fileno())
+            if mode is not None:
+                os.chmod(tmp, mode)
             os.replace(tmp, path)
         except OSError:
             # 写失败时清掉半截临时文件；原文件因尚未 replace 而保持完整
@@ -274,9 +279,10 @@ def _atomic_write(path: str, text: str) -> None:
             raise
 
 
-def _atomic_write_json(path: str, data: object, indent: int = 2) -> None:
+def _atomic_write_json(path: str, data: object, indent: int = 2,
+                       mode: int | None = None) -> None:
     """原子写入 JSON（UTF-8、保留中文可读）。"""
-    _atomic_write(path, _json.dumps(data, ensure_ascii=False, indent=indent))
+    _atomic_write(path, _json.dumps(data, ensure_ascii=False, indent=indent), mode)
 
 
 def _resolve_plugin_data_dir() -> str:
@@ -900,11 +906,106 @@ def _bpcs_config_path() -> str:
     return os.path.join(exe_dir, "pcs_config.json")  # HOME 缺失时落到程序目录
 
 
+def _fetch_uid_by_bduss(bduss: str, stoken: str = "", cookies: str = "") -> tuple[str, str]:
+    """查一次网盘账号信息，返回 `(uid, 昵称)`；查不到返回 `("", "")`。
+
+    登录要写进 pcs_config.json 的 uid，BaiduPCS-Go 自己的 login 是调贴吧接口拿的；
+    这里换成网盘接口，因为 login 只能从命令行收凭证（同机用户 ps / /proc/<pid>/cmdline 可见），
+    而写配置这条路需要我们先把 uid 问出来。请求失败按「无法确认」处理，由调用方回退。"""
+    url = "https://pan.baidu.com/rest/2.0/xpan/nas?method=uinfo&clienttype=0"
+    try:
+        sess = _req.Session()
+        sess.headers.update({"User-Agent": _BROWSER_UA})
+        if cookies:
+            for part in cookies.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    if k.strip() and v.strip():
+                        sess.cookies.set(k.strip(), v.strip(), domain=".baidu.com")
+        else:
+            sess.cookies.set("BDUSS", bduss, domain=".baidu.com")
+            if stoken:
+                sess.cookies.set("STOKEN", stoken, domain=".baidu.com")
+        j = sess.get(url, timeout=10).json()
+    except Exception as e:
+        logger.warning(f"[baidu_netdisk] ⚠️ 查询账号 uid 失败（稍后回退命令行登录）: {e}")
+        return "", ""
+    uid = str(j.get("uk") or "").strip()
+    try:
+        errno = int(j.get("errno", -1))
+    except (TypeError, ValueError):
+        errno = -1
+    if errno != 0 or not uid.isdigit():
+        logger.warning(f"[baidu_netdisk] ⚠️ 账号 uid 查询未通过: errno={j.get('errno')}")
+        return "", ""
+    name = str(j.get("netdisk_name") or j.get("baidu_name") or "").strip()
+    return uid, name
+
+
+def _login_via_config(bduss: str, stoken: str = "", cookies: str = "") -> dict:
+    """直接把凭证写进 pcs_config.json 完成登录；成功返回 `{"success": True}`。
+
+    BaiduPCS-Go 只在 `login -bduss=`/`-cookies=` 里收凭证，凭证因此必然出现在进程命令行里。
+    这里改为复刻它官方登录流程的落盘结果（写一条用户记录，并把 baidu_active_uid 指向该 uid，
+    BPCS 启动时按 uid 载入当前账号），然后用 who 验证，凭证全程不进命令行。
+
+    任何一步不成立都返回 `{"error": ...}` 并**完整还原原配置**，由调用方回退命令行登录：
+    登录是插件的命脉，宁可退到有暴露风险的老路径，也不能留下半登录状态。"""
+    uid, name = _fetch_uid_by_bduss(bduss, stoken, cookies)
+    if not uid:
+        return {"error": "未能确认账号 uid"}
+    config_path = _bpcs_config_path()
+    if not os.path.exists(config_path):
+        # 首次登录时配置文件还不存在：先跑一次 who 让 BPCS 自己生成（字段齐全、权限 0600）
+        _run_bpcs(["who"], timeout=15)
+    if not os.path.exists(config_path):
+        return {"error": f"未找到 {config_path}"}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            original = f.read()
+        cfg = _json.loads(original)
+        if not isinstance(cfg, dict):
+            return {"error": "配置文件格式不正确"}
+    except Exception as e:
+        return {"error": f"读取配置失败: {e}"}
+
+    entry = {
+        "uid": int(uid), "name": name, "sex": "default", "age": 0,
+        "bduss": bduss, "ptoken": "", "stoken": stoken, "baiduid": "",
+        "sboxtkn": "", "cookies": cookies, "accesstoken": "", "workdir": "/",
+    }
+    users = cfg.get("baidu_user_list")
+    users = [u for u in users if isinstance(u, dict)] if isinstance(users, list) else []
+    cfg["baidu_user_list"] = [u for u in users if str(u.get("uid")) != uid] + [entry]
+    cfg["baidu_active_uid"] = int(uid)
+
+    try:
+        _atomic_write_json(config_path, cfg, indent=1, mode=0o600)
+    except OSError as e:
+        return {"error": f"写入配置失败: {e}"}
+
+    out, err, _ = _run_bpcs(["who"], timeout=15)
+    text = ((out or "") + " " + (err or "")).strip()
+    if f"uid: {uid}" not in (out or ""):
+        with contextlib.suppress(OSError):
+            _atomic_write(config_path, original, mode=0o600)
+        return {"error": f"写入配置后校验未通过: {text[:120]}"}
+    return {"success": True}
+
+
 def login_bduss_bpcs(bduss: str, stoken: str = "", allow_insecure_tls: bool = False) -> dict:
     """用 BDUSS + STOKEN 登录 BaiduPCS-Go。"""
     global _bpcs_inited
     if not _auto_download_bpcs(allow_insecure_tls):
         return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或联系管理员用 /pan pcs 手动下载）"}
+    # 优先写配置文件登录：login 只能从命令行收凭证，而同机任何用户都能读到进程命令行
+    via_config = _login_via_config(bduss, stoken)
+    if "success" in via_config:
+        _bpcs_inited = True
+        logger.info("[baidu_netdisk] BaiduPCS-Go logged in via /pan login 3/bduss（配置写入，凭证未进命令行）")
+        return {"success": True}
+    logger.info(f"[baidu_netdisk] 写配置登录不可用（{via_config.get('error')}），回退命令行登录")
     args = ["login", f"-bduss={bduss}"]
     if stoken:
         args.append(f"-stoken={stoken}")
@@ -954,12 +1055,21 @@ def login_cookies_bpcs(cookie_str: str, allow_insecure_tls: bool = False) -> dic
         if part.strip() and "=" in part.strip()
         and "_BFESS" not in part
     )
+    stoken_m = re.search(r'STOKEN=([^\s;]+)', cleaned)
+    bduss_m = re.search(r'BDUSS=([^\s;]+)', cleaned)
+    if bduss_m:
+        # 同 bduss 登录：优先写配置文件，凭证不进命令行（stoken 也一起写，省掉事后的补写）
+        via_config = _login_via_config(bduss_m.group(1),
+                                       stoken_m.group(1) if stoken_m else "", cleaned)
+        if "success" in via_config:
+            _bpcs_inited = True
+            logger.info("[baidu_netdisk] BaiduPCS-Go logged in via cookies（配置写入，凭证未进命令行）")
+            return {"success": True}
+        logger.info(f"[baidu_netdisk] 写配置登录不可用（{via_config.get('error')}），回退命令行登录")
     out, err, code = _run_bpcs(["login", f"-cookies={cleaned}"], timeout=30)
     text = (out or "") + chr(10) + (err or "")
     if code == 0 and "失败" not in text and "错误" not in text:
         # cookies 登录后 stoken 字段不会自动填充，手动补写
-        stoken_m = re.search(r'STOKEN=([^\s;]+)', cleaned)
-        bduss_m = re.search(r'BDUSS=([^\s;]+)', cleaned)
         if stoken_m:
             _patch_config_stoken(stoken_m.group(1), bduss_m.group(1) if bduss_m else "")
         _bpcs_inited = True
@@ -3109,7 +3219,8 @@ class BaiduNetdiskPlugin(Star):
             "2  账密登录    /pan login 2 <账号> <密码>  或  /pan login pwd <账号> <密码>\n"
             "3  BDUSS       /pan login 3 <BDUSS> [STOKEN]  或  /pan login bduss <BDUSS> [STOKEN]\n"
             "4  Cookie      /pan login 4 <完整Cookies>  或  /pan login cookies <完整Cookies>\n"
-            "0  退出登录    /pan login 0  或  /pan login out"
+            "0  退出登录    /pan login 0  或  /pan login out\n"
+            "⚠️ 密码、BDUSS、Cookie 都等同于账号密码：请私聊执行，用完后撤回消息"
         )
 
     async def _login_dispatch(self, event: AstrMessageEvent, parts: list) -> AsyncGenerator[MessageEventResult, None]:
@@ -3141,6 +3252,8 @@ class BaiduNetdiskPlugin(Star):
                 return
             bduss = parts[2]
             stoken = parts[3] if len(parts) >= 4 else ""
+            if not event.is_private_chat():
+                yield event.plain_result("⚠️ BDUSS 等同于账号密码，会留在聊天记录中，建议私聊执行并撤回消息")
             yield event.plain_result("⏳ 正在登录...")
             result = await asyncio.to_thread(login_bduss_bpcs, bduss, stoken,
                                              self._allow_insecure_tls())
@@ -3160,6 +3273,8 @@ class BaiduNetdiskPlugin(Star):
                 return
             # Cookie 字符串本身不含空格分隔的多段，用剩余参数拼接，避免被空格截断
             cookie_str = " ".join(parts[2:])
+            if not event.is_private_chat():
+                yield event.plain_result("⚠️ Cookie 等同于账号密码，会留在聊天记录中，建议私聊执行并撤回消息")
             yield event.plain_result("⏳ 正在注入 Cookies...")
             result = await asyncio.to_thread(login_cookies_bpcs, cookie_str,
                                              self._allow_insecure_tls())
