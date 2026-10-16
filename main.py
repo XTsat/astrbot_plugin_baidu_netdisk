@@ -5,6 +5,7 @@ Download files from Baidu Netdisk share links using BaiduPCS-Go,
 then send via AstrBot's platform adapters.
 """
 import asyncio
+import contextlib
 import hashlib
 import os
 import platform
@@ -17,6 +18,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from collections.abc import AsyncGenerator
 import json as _json
 import requests as _req
 
@@ -91,6 +93,84 @@ def _sanity_check_binary(data: bytes, what: str = "下载的文件") -> str | No
     return None
 
 
+# ---- 配置读取 ----
+
+
+def _config_int(config: AstrBotConfig, key: str, default: int,
+                minimum: int | None = None, maximum: int | None = None) -> int:
+    """读取整数配置：None/空串/非数字等非法值回退默认值，超出范围则收敛到边界。
+
+    配置由用户在 WebUI 或配置文件中手填，非法值不应让插件加载失败、也不该在命令执行中途抛异常。"""
+    raw = config.get(key, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(f"[baidu_netdisk] ⚠️ 配置 {key}={raw!r} 不是合法整数，已按默认值 {default} 处理")
+        return default
+    if minimum is not None and value < minimum:
+        logger.warning(f"[baidu_netdisk] ⚠️ 配置 {key}={value} 小于允许的最小值 {minimum}，已按 {minimum} 处理")
+        value = minimum
+    if maximum is not None and value > maximum:
+        logger.warning(f"[baidu_netdisk] ⚠️ 配置 {key}={value} 大于允许的最大值 {maximum}，已按 {maximum} 处理")
+        value = maximum
+    return value
+
+
+def _config_bool(config: AstrBotConfig, key: str, default: bool) -> bool:
+    """读取布尔配置，兼容字符串写法（"false"/"0"/"no"/"off" 视为 False）。
+
+    直接写 bool("false") 会得到 True：配置文件被手工改成字符串时开关会静默反向。"""
+    raw = config.get(key, default)
+    if isinstance(raw, str):
+        lowered = raw.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off"):
+            return False
+        logger.warning(f"[baidu_netdisk] ⚠️ 配置 {key}={raw!r} 不是合法布尔值，已按默认值 {default} 处理")
+        return default
+    return bool(raw)
+
+
+# ---- 并发控制 ----
+
+_MAX_CONCURRENT_DOWNLOADS = 2  # 同时进行的下载任务上限（每个任务一个 BaiduPCS-Go 进程，抢同一份带宽与磁盘）
+_USER_LOCK_MAX_ENTRIES = 200  # 用户级串行锁最多保留多少条，超出时清理空闲条目
+_download_semaphore: asyncio.Semaphore | None = None
+_active_download_slots = 0  # 已占用的下载通道数（仅在事件循环内读写，用于排队时告知用户）
+
+
+def _get_download_semaphore() -> asyncio.Semaphore:
+    """懒创建下载并发信号量（首次在事件循环内调用时创建）。"""
+    global _download_semaphore
+    if _download_semaphore is None:
+        _download_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
+    return _download_semaphore
+
+
+@contextlib.asynccontextmanager
+async def _download_slot() -> AsyncGenerator[bool, None]:
+    """占用一个下载通道，通道占满时排队等待；yield 出的是「本次是否需要排队」。
+
+    用于限制同时进行的下载任务数：并发任务各起一个 BaiduPCS-Go 进程写同一个下载目录，
+    既抢带宽也互相拖慢（AGENTS 4.7 并发限制）。"""
+    global _active_download_slots
+    sem = _get_download_semaphore()
+    queued = _active_download_slots >= _MAX_CONCURRENT_DOWNLOADS
+    _active_download_slots += 1
+    acquired = False
+    try:
+        await sem.acquire()
+        acquired = True
+        yield queued
+    finally:
+        _active_download_slots -= 1
+        if acquired:
+            # 只在真正拿到许可时释放：等待期间被取消（生成器提前关闭 / 任务取消）
+            # 若照样 release，会凭空多出许可，上限就形同虚设
+            sem.release()
+
+
 def _resolve_plugin_data_dir() -> str:
     """解析 AstrBot 的 plugin-data 目录（data/plugin_data/<插件目录名>/）。
     优先走官方 StarTools.get_data_dir()；兼容旧版 AstrBot 时回退到 astrbot_path 推导；
@@ -128,6 +208,9 @@ FLASH_TASK_LIMIT_MB = 200
 _ZIP_MAX_MB_DEFAULT = 10240  # 文件夹打包上限默认值（MB，10GB 对应 QQ 闪传大文件通道）；可在配置中修改，0=不限制
 _SEND_FILES_THRESHOLD_DEFAULT = 3  # 文件夹内文件数 ≤ 此值时逐个发送（原始文件更易命中秒传），超过则打包 zip
 DOWNLOAD_TIMEOUT_SECONDS = -1  # 下载超时秒数，-1 = 不超时（可在配置中修改）
+# 配置为「不超时」时的兜底上限：BaiduPCS-Go 若卡死，进程会一直占着下载通道与线程，
+# 拖住所有用户；12 小时足以覆盖超大文件夹的正常下载，又能确保最终能回收资源
+_DOWNLOAD_HARD_CAP_SECONDS = 12 * 3600
 
 # 本插件下载过的本地文件清单，定时清理时只删这些，不动下载目录里的其他文件
 _MANIFEST_PATH = os.path.join(PLUGIN_DATA_DIR, "cleanup_manifest.json")
@@ -1262,9 +1345,10 @@ def _collect_files_under(root: str) -> list:
 
 def _collect_new_files(root: str, before: dict, bucket: str = "") -> list:
     """收集 root 下相对 before 快照「新增或内容有变化」的文件，即本次下载产生的文件。
-    bucket 非空时优先只收该转存子目录下的文件：转存目录按用户隔离，
-    并发下载时不会把别人的下载结果算进本次清单。
-    不再有「收集全部文件」的兜底，避免把下载目录里的历史文件或他人文件发出去。"""
+
+    bucket 非空时只认该子目录下的文件：转存目录按用户隔离，bucket 未命中说明本地目录
+    结构与预期不符，此时宁可返回空（上层报「未找到本次下载的文件」）也不能回退成
+    「下载期间所有变化过的文件」——那正是并发下载时把他人文件当成自己的发出去的路径。"""
     def _in_bucket(path: str) -> bool:
         return not bucket or bucket in path.replace("\\", "/").split("/")
 
@@ -1280,6 +1364,8 @@ def _collect_new_files(root: str, before: dict, bucket: str = "") -> list:
             if before.get(p) == (st.st_size, st.st_mtime_ns):
                 continue  # 下载前已存在且大小/时间未变，不是本次产生的
             target.append({"path": p, "name": n, "size": st.st_size})
+    if bucket:
+        return matched
     return matched or others
 
 
@@ -1350,10 +1436,17 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
 
     # 下载（使用 subprocess.Popen 实时读输出，避免 BPCS 卡住）
     _run_bpcs(["config", "set", "-savedir", DOWNLOAD_DIR], timeout=15)
+    # 超时语义与配置一致：正数=固定超时；-1（默认，不超时）不按体积设上限，
+    # 但仍受兜底上限保护，避免 BaiduPCS-Go 卡死时进程与下载通道被永久占用
     if DOWNLOAD_TIMEOUT_SECONDS > 0:
         dl_timeout = DOWNLOAD_TIMEOUT_SECONDS
+    elif is_dir or file_size <= 0:
+        # 文件夹/大小未知：无法按体积估算（原先固定 3600 秒，大文件夹会被中途砍掉）
+        dl_timeout = _DOWNLOAD_HARD_CAP_SECONDS
     else:
-        dl_timeout = max(600, int(file_size / (1024 * 1024) * 15)) if not is_dir else 3600
+        # 单文件按体积保守估算（约合 1/15 MB/s 的下限速率），并与兜底上限取小
+        dl_timeout = min(_DOWNLOAD_HARD_CAP_SECONDS,
+                         max(600, int(file_size / (1024 * 1024) * 15)))
     logger.info(f"[baidu_netdisk] download_from_cloud: starting download, dl_timeout={dl_timeout}s, progress_queue={progress_queue is not None}")
     # 把文件信息塞进队列，给 handler 监控文件大小用
     # 如果 file_size 为0但文件非目录，把 0 也塞进去，让 handler 监控时用实际文件大小
@@ -1594,6 +1687,9 @@ class BaiduNetdiskPlugin(Star):
         self._share_cache = {}
         # 下载去重锁：dl_key -> 发起用户，同时用于判断「该用户是否有下载进行中」
         self._active_downloads = {}
+        # 用户级串行锁：同一用户的两个下载任务不能同时跑（共用同一个转存目录，
+        # 并发时会把对方的文件算进本次结果、也会互相踩转存目录）
+        self._user_locks = {}
 
         # 设置 BaiduPCS-Go 下载目录（exe 可用时才设置）
         if _ensure_bpcs_exe():
@@ -1614,23 +1710,23 @@ class BaiduNetdiskPlugin(Star):
 
         # 读取下载后自动删除网盘文件开关
         global _auto_delete_cloud
-        _auto_delete_cloud = bool(self.config.get("auto_delete_cloud", True))
+        _auto_delete_cloud = _config_bool(self.config, "auto_delete_cloud", True)
         logger.info(f"[baidu_netdisk] auto_delete_cloud: {_auto_delete_cloud}")
 
         # 进度显示配置
-        self._progress_enabled = bool(self.config.get("progress_enabled", False))
-        self._progress_interval = int(self.config.get("progress_interval", 30))
+        self._progress_enabled = _config_bool(self.config, "progress_enabled", False)
+        self._progress_interval = _config_int(self.config, "progress_interval", 30, minimum=1)
         if self._progress_enabled:
             logger.info(f"[baidu_netdisk] progress reporting enabled, interval={self._progress_interval}s")
 
         # 下载超时（秒），-1 = 不超时
         global DOWNLOAD_TIMEOUT_SECONDS
-        DOWNLOAD_TIMEOUT_SECONDS = int(self.config.get("timeout_seconds", -1))
+        DOWNLOAD_TIMEOUT_SECONDS = _config_int(self.config, "timeout_seconds", -1, minimum=-1)
         logger.info(f"[baidu_netdisk] download timeout: {DOWNLOAD_TIMEOUT_SECONDS}s")
 
-        # 读取每天定时清理本地文件的小时数
+        # 读取每天定时清理本地文件的小时数（-1 = 关闭，0-23 = 触发小时）
         global _local_cleanup_hour
-        cleanup_hour = int(self.config.get("local_cleanup_hour", 3))
+        cleanup_hour = _config_int(self.config, "local_cleanup_hour", 3, minimum=-1, maximum=23)
         _local_cleanup_hour = cleanup_hour
         _schedule_local_cleanup(cleanup_hour)
 
@@ -1668,6 +1764,20 @@ class BaiduNetdiskPlugin(Star):
 
     def _user_has_active_download(self, user_id: str) -> bool:
         return user_id in self._active_downloads.values()
+
+    def _user_download_lock(self, user_id: str) -> asyncio.Lock:
+        """该用户的下载串行锁：同一用户的两个下载任务排队执行。
+
+        转存目录与本地 bucket 都按用户划分，同一用户的两个任务并发跑会把彼此下载的
+        文件算进本次结果、也会争抢同一个转存目录。字典做空闲清理，避免按用户数无限增长。"""
+        lock = self._user_locks.get(user_id)
+        if lock is None:
+            if len(self._user_locks) >= _USER_LOCK_MAX_ENTRIES:
+                for key in [k for k, v in self._user_locks.items() if not v.locked() and k != user_id]:
+                    del self._user_locks[key]
+            lock = asyncio.Lock()
+            self._user_locks[user_id] = lock
+        return lock
 
     def _transfer_and_list(self, surl: str, pwd: str, user_id: str) -> dict:
         """线程安全的"切换分享链接"：API 直连列出分享目录树并更新该用户的缓存。
@@ -1756,8 +1866,8 @@ class BaiduNetdiskPlugin(Star):
         return sid and sid in self._blacklist
 
     def _get_max_mb(self) -> int:
-        # 0 = 不限制；official 模式下硬限 200MB（发了也发不了）
-        cap = int(self.config.get("max_file_size", 200))
+        # 0 = 不限制（与 _conf_schema.json 的默认值一致）；official 模式下硬限 200MB（发了也发不了）
+        cap = _config_int(self.config, "max_file_size", 0, minimum=0)
         if self._get_send_mode() == "official":
             cap = min(cap, FLASH_TASK_LIMIT_MB) if cap > 0 else FLASH_TASK_LIMIT_MB
         return cap
@@ -1767,17 +1877,11 @@ class BaiduNetdiskPlugin(Star):
 
     def _get_zip_max_mb(self) -> int:
         """文件夹打包 zip 的体积上限（MB），0 = 不限制。"""
-        try:
-            return max(0, int(self.config.get("zip_max_size", _ZIP_MAX_MB_DEFAULT)))
-        except (TypeError, ValueError):
-            return _ZIP_MAX_MB_DEFAULT
+        return _config_int(self.config, "zip_max_size", _ZIP_MAX_MB_DEFAULT, minimum=0)
 
     def _get_send_files_threshold(self) -> int:
         """文件夹内文件数 ≤ 此值时逐个发送（原始文件更易命中秒传），0 = 总是打包。"""
-        try:
-            return max(0, int(self.config.get("send_files_threshold", _SEND_FILES_THRESHOLD_DEFAULT)))
-        except (TypeError, ValueError):
-            return _SEND_FILES_THRESHOLD_DEFAULT
+        return _config_int(self.config, "send_files_threshold", _SEND_FILES_THRESHOLD_DEFAULT, minimum=0)
 
     async def _send_file(self, event: AstrMessageEvent, dl: dict, share_url: str = "") -> bool:
         """根据平台类型和文件大小选择发送方式。"""
@@ -2016,48 +2120,50 @@ class BaiduNetdiskPlugin(Star):
             return "⏳ 该文件正在下载中，请稍候..."
         self._active_downloads[dl_key] = uid
         try:
-            # 按需精准转存：只转存选中的文件夹，再从暂存目录下载
-            tr = await asyncio.to_thread(self._ensure_transferred_sync, folder_path, uid)
-            if "error" in tr:
-                return tr["error"]
-            prog_q = queue.Queue() if self._progress_enabled else None
-            dl_future = asyncio.create_task(asyncio.to_thread(
-                download_from_cloud, tr["name"], self._get_max_mb(), prog_q,
-                self._cloud_dir_for(uid), _user_bucket(uid)))
-            if prog_q:
-                file_info = None
-                while not dl_future.done():
-                    try:
-                        msg = prog_q.get_nowait()
-                        if isinstance(msg, tuple) and msg[0] == "_info":
-                            file_info = (msg[1], msg[2])
-                        elif isinstance(msg, tuple) and msg[0] == "_error":
-                            await event.send(event.plain_result(f"❌ {msg[1]}"))
-                        elif isinstance(msg, str):
-                            await event.send(event.plain_result(msg))
-                    except queue.Empty:
-                        pass
-                    if file_info and not dl_future.done():
-                        fname, total = file_info
-                        current = _get_local_file_size(fname)
-                        if current > 0 and total > 0:
-                            pct = min(current / total * 100, 99.9)
-                            await event.send(event.plain_result(f"⏬ 下载中: {pct:.1f}%"))
-                    await self._interruptible_sleep(dl_future, self._progress_interval)
-            dl = await dl_future
-            if "error" in dl:
-                return dl["error"]
+            async with self._user_download_lock(uid):
+                # 按需精准转存：只转存选中的文件夹，再从暂存目录下载
+                tr = await asyncio.to_thread(self._ensure_transferred_sync, folder_path, uid)
+                if "error" in tr:
+                    return tr["error"]
+                prog_q = queue.Queue() if self._progress_enabled else None
+                async with _download_slot():
+                    dl_future = asyncio.create_task(asyncio.to_thread(
+                        download_from_cloud, tr["name"], self._get_max_mb(), prog_q,
+                        self._cloud_dir_for(uid), _user_bucket(uid)))
+                    if prog_q:
+                        file_info = None
+                        while not dl_future.done():
+                            try:
+                                msg = prog_q.get_nowait()
+                                if isinstance(msg, tuple) and msg[0] == "_info":
+                                    file_info = (msg[1], msg[2])
+                                elif isinstance(msg, tuple) and msg[0] == "_error":
+                                    await event.send(event.plain_result(f"❌ {msg[1]}"))
+                                elif isinstance(msg, str):
+                                    await event.send(event.plain_result(msg))
+                            except queue.Empty:
+                                pass
+                            if file_info and not dl_future.done():
+                                fname, total = file_info
+                                current = _get_local_file_size(fname)
+                                if current > 0 and total > 0:
+                                    pct = min(current / total * 100, 99.9)
+                                    await event.send(event.plain_result(f"⏬ 下载中: {pct:.1f}%"))
+                            await self._interruptible_sleep(dl_future, self._progress_interval)
+                    dl = await dl_future
+                if "error" in dl:
+                    return dl["error"]
 
-            if dl.get("is_dir"):
-                # 文件夹不能直接发送：≤阈值逐个发，否则打包 zip，超限则降级为路径+清单
-                share_url = f"https://pan.baidu.com/s/{self._cache_get(uid)['surl']}"
-                return await self._send_folder(event, dl, share_url)
-            else:
-                share_url = f"https://pan.baidu.com/s/{self._cache_get(uid)['surl']}"
-                sent = await self._send_file(event, dl, share_url)
-                if sent:
-                    return f"文件 '{folder_path}' 下载并发送完成，本地路径: {dl['path']}"
-                return f"文件 '{folder_path}' 已下载到 {dl['path']}，但发送失败"
+                if dl.get("is_dir"):
+                    # 文件夹不能直接发送：≤阈值逐个发，否则打包 zip，超限则降级为路径+清单
+                    share_url = f"https://pan.baidu.com/s/{self._cache_get(uid)['surl']}"
+                    return await self._send_folder(event, dl, share_url)
+                else:
+                    share_url = f"https://pan.baidu.com/s/{self._cache_get(uid)['surl']}"
+                    sent = await self._send_file(event, dl, share_url)
+                    if sent:
+                        return f"文件 '{folder_path}' 下载并发送完成，本地路径: {dl['path']}"
+                    return f"文件 '{folder_path}' 已下载到 {dl['path']}，但发送失败"
         finally:
             self._active_downloads.pop(dl_key, None)
 
@@ -2096,35 +2202,37 @@ class BaiduNetdiskPlugin(Star):
             return "⏳ 该文件正在下载中，请稍候..."
         self._active_downloads[dl_key] = uid
         try:
-            # 先转存分享根目录全部文件到该用户的暂存目录，再整体下载
-            # （特大分享会因网盘剩余空间不足失败，错误信息会提示改用按文件下载）
-            tr = await asyncio.to_thread(
-                _transfer_via_api, self._cache_get(uid)["surl"], self._cache_get(uid)["pwd"],
-                self._cloud_dir_for(uid))
-            if "error" in tr:
-                return tr["error"]
-            prog_q = queue.Queue() if self._progress_enabled else None
-            dl_future = asyncio.create_task(asyncio.to_thread(
-                download_from_cloud, "", self._get_max_mb(), prog_q,
-                self._cloud_dir_for(uid), _user_bucket(uid)))
-            if prog_q:
-                while not dl_future.done():
-                    try:
-                        msg = prog_q.get_nowait()
-                        if isinstance(msg, tuple) and msg[0] == "_error":
-                            await event.send(event.plain_result(f"❌ {msg[1]}"))
-                        elif isinstance(msg, str):
-                            await event.send(event.plain_result(msg))
-                    except queue.Empty:
-                        pass
-                    await self._interruptible_sleep(dl_future, self._progress_interval)
-            dl = await dl_future
-            if "error" in dl:
-                return dl["error"]
+            async with self._user_download_lock(uid):
+                # 先转存分享根目录全部文件到该用户的暂存目录，再整体下载
+                # （特大分享会因网盘剩余空间不足失败，错误信息会提示改用按文件下载）
+                tr = await asyncio.to_thread(
+                    _transfer_via_api, self._cache_get(uid)["surl"], self._cache_get(uid)["pwd"],
+                    self._cloud_dir_for(uid))
+                if "error" in tr:
+                    return tr["error"]
+                prog_q = queue.Queue() if self._progress_enabled else None
+                async with _download_slot():
+                    dl_future = asyncio.create_task(asyncio.to_thread(
+                        download_from_cloud, "", self._get_max_mb(), prog_q,
+                        self._cloud_dir_for(uid), _user_bucket(uid)))
+                    if prog_q:
+                        while not dl_future.done():
+                            try:
+                                msg = prog_q.get_nowait()
+                                if isinstance(msg, tuple) and msg[0] == "_error":
+                                    await event.send(event.plain_result(f"❌ {msg[1]}"))
+                                elif isinstance(msg, str):
+                                    await event.send(event.plain_result(msg))
+                            except queue.Empty:
+                                pass
+                            await self._interruptible_sleep(dl_future, self._progress_interval)
+                    dl = await dl_future
+                if "error" in dl:
+                    return dl["error"]
 
-            # 全部下载本质也是文件夹：≤阈值逐个发，否则打包 zip，超限则降级为路径+清单
-            share_url = f"https://pan.baidu.com/s/{self._cache_get(uid)['surl']}"
-            return await self._send_folder(event, dl, share_url, label="全部文件")
+                # 全部下载本质也是文件夹：≤阈值逐个发，否则打包 zip，超限则降级为路径+清单
+                share_url = f"https://pan.baidu.com/s/{self._cache_get(uid)['surl']}"
+                return await self._send_folder(event, dl, share_url, label="全部文件")
         finally:
             self._active_downloads.pop(dl_key, None)
 
@@ -2532,78 +2640,85 @@ class BaiduNetdiskPlugin(Star):
             _lock_acquired = True
             try:
                 logger.info(f"[baidu_netdisk] on_pan down: dl_path={dl_path}, progress_enabled={self._progress_enabled}")
-                tr = await asyncio.to_thread(self._ensure_transferred_sync, dl_path, uid)
-                if "error" in tr:
-                    yield event.plain_result(f"❌ {tr['error']}")
-                    return
-                # 自动识别类型（目录树已给出 is_dir）：下载前先告知用户是文件夹还是文件
-                kind = "文件夹" if tr.get("is_dir") else "文件"
-                yield event.plain_result(f"⏳ 正在下载{kind}: {dl_path} ...")
-                prog_q = queue.Queue() if self._progress_enabled else None
-                dl_future = asyncio.create_task(asyncio.to_thread(
-                    download_from_cloud, tr["name"], self._get_max_mb(), prog_q,
-                    self._cloud_dir_for(uid), _user_bucket(uid)))
-                if prog_q:
-                    file_info = None
-                    _last_prog_size = None
-                    _last_prog_time = None
-                    while not dl_future.done():
-                        try:
-                            msg = prog_q.get_nowait()
-                            if isinstance(msg, tuple) and msg[0] == "_info":
-                                file_info = (msg[1], msg[2])  # (name, size)
-                            elif isinstance(msg, tuple) and msg[0] == "_error":
-                                yield event.plain_result(f"❌ {msg[1]}")
-                            elif isinstance(msg, str):
-                                yield event.plain_result(msg)
-                        except queue.Empty:
-                            pass
-                        # 监控本地文件大小
-                        if file_info and not dl_future.done():
-                            fname, total = file_info
-                            current = _get_local_file_size(fname)
-                            # 如果 total==0 但本地文件有大小，用本地文件大小作为 total
-                            if total <= 0 and current > 0:
-                                total = current
-                                file_info = (fname, total)
-                            if current > 0 and total > 0:
-                                now = time.time()
-                                if _last_prog_time is None or now - _last_prog_time >= 1.0:
-                                    if _last_prog_size is not None and _last_prog_time is not None:
-                                        dt = now - _last_prog_time
-                                        if dt > 0:
-                                            speed_bps = (current - _last_prog_size) / dt
-                                            speed_str = f"{speed_bps/1024/1024:.2f} MB/s" if speed_bps >= 1024*1024 else f"{speed_bps/1024:.1f} KB/s"
-                                            remain = (total - current) / speed_bps if speed_bps > 0 else 0
-                                            if remain >= 3600:
-                                                eta = f"{remain/3600:.1f}h"
-                                            elif remain >= 60:
-                                                eta = f"{remain/60:.1f}m"
+                # 同一用户的下载串行执行：共用同一个转存目录与本地 bucket，并发会把彼此的文件算进来
+                async with self._user_download_lock(uid):
+                    tr = await asyncio.to_thread(self._ensure_transferred_sync, dl_path, uid)
+                    if "error" in tr:
+                        yield event.plain_result(f"❌ {tr['error']}")
+                        return
+                    # 自动识别类型（目录树已给出 is_dir）：下载前先告知用户是文件夹还是文件
+                    kind = "文件夹" if tr.get("is_dir") else "文件"
+                    yield event.plain_result(f"⏳ 正在下载{kind}: {dl_path} ...")
+                    prog_q = queue.Queue() if self._progress_enabled else None
+                    async with _download_slot() as _queued:
+                        if _queued:
+                            yield event.plain_result(
+                                f"⏳ 当前下载任务已满（上限 {_MAX_CONCURRENT_DOWNLOADS} 个），"
+                                "本次已排队，前面的任务结束后自动开始...")
+                        dl_future = asyncio.create_task(asyncio.to_thread(
+                            download_from_cloud, tr["name"], self._get_max_mb(), prog_q,
+                            self._cloud_dir_for(uid), _user_bucket(uid)))
+                        if prog_q:
+                            file_info = None
+                            _last_prog_size = None
+                            _last_prog_time = None
+                            while not dl_future.done():
+                                try:
+                                    msg = prog_q.get_nowait()
+                                    if isinstance(msg, tuple) and msg[0] == "_info":
+                                        file_info = (msg[1], msg[2])  # (name, size)
+                                    elif isinstance(msg, tuple) and msg[0] == "_error":
+                                        yield event.plain_result(f"❌ {msg[1]}")
+                                    elif isinstance(msg, str):
+                                        yield event.plain_result(msg)
+                                except queue.Empty:
+                                    pass
+                                # 监控本地文件大小
+                                if file_info and not dl_future.done():
+                                    fname, total = file_info
+                                    current = _get_local_file_size(fname)
+                                    # 如果 total==0 但本地文件有大小，用本地文件大小作为 total
+                                    if total <= 0 and current > 0:
+                                        total = current
+                                        file_info = (fname, total)
+                                    if current > 0 and total > 0:
+                                        now = time.time()
+                                        if _last_prog_time is None or now - _last_prog_time >= 1.0:
+                                            if _last_prog_size is not None and _last_prog_time is not None:
+                                                dt = now - _last_prog_time
+                                                if dt > 0:
+                                                    speed_bps = (current - _last_prog_size) / dt
+                                                    speed_str = f"{speed_bps/1024/1024:.2f} MB/s" if speed_bps >= 1024*1024 else f"{speed_bps/1024:.1f} KB/s"
+                                                    remain = (total - current) / speed_bps if speed_bps > 0 else 0
+                                                    if remain >= 3600:
+                                                        eta = f"{remain/3600:.1f}h"
+                                                    elif remain >= 60:
+                                                        eta = f"{remain/60:.1f}m"
+                                                    else:
+                                                        eta = f"{remain:.0f}s"
+                                                    _last_prog_size = current
+                                                    _last_prog_time = now
+                                                    pct = min(current / total * 100, 100.0)
+                                                    yield event.plain_result(f"⏬ {pct:.1f}%  {speed_str}  ETA {eta}")
+                                                    if current >= total:
+                                                        yield event.plain_result("✅ 下载完成，正在发送...")
+                                                        break
                                             else:
-                                                eta = f"{remain:.0f}s"
-                                            _last_prog_size = current
-                                            _last_prog_time = now
-                                            pct = min(current / total * 100, 100.0)
-                                            yield event.plain_result(f"⏬ {pct:.1f}%  {speed_str}  ETA {eta}")
-                                            if current >= total:
-                                                yield event.plain_result("✅ 下载完成，正在发送...")
-                                                break
-                                    else:
-                                        _last_prog_size = current
-                                        _last_prog_time = now
-                        await self._interruptible_sleep(dl_future, self._progress_interval)
-                dl = await dl_future
-                logger.info(f"[baidu_netdisk] on_pan down: download complete, dl={dl}")
-                if "error" in dl:
-                    logger.error(f"[baidu_netdisk] on_pan down: download error: {dl['error']}")
-                    yield event.plain_result(f"❌ {dl['error']}")
-                else:
-                    if dl.get("is_dir"):
-                        # 文件夹不能直接发送：≤阈值逐个发，否则打包 zip，超限则降级为路径+清单
-                        share_url = f"https://pan.baidu.com/s/{self._cache_get(uid)['surl']}"
-                        yield event.plain_result(await self._send_folder(event, dl, share_url))
+                                                _last_prog_size = current
+                                                _last_prog_time = now
+                                await self._interruptible_sleep(dl_future, self._progress_interval)
+                        dl = await dl_future
+                    logger.info(f"[baidu_netdisk] on_pan down: download complete, dl={dl}")
+                    if "error" in dl:
+                        logger.error(f"[baidu_netdisk] on_pan down: download error: {dl['error']}")
+                        yield event.plain_result(f"❌ {dl['error']}")
                     else:
-                        yield event.chain_result([File(name=dl.get("name", "file"), file=dl["path"])])
+                        if dl.get("is_dir"):
+                            # 文件夹不能直接发送：≤阈值逐个发，否则打包 zip，超限则降级为路径+清单
+                            share_url = f"https://pan.baidu.com/s/{self._cache_get(uid)['surl']}"
+                            yield event.plain_result(await self._send_folder(event, dl, share_url))
+                        else:
+                            yield event.chain_result([File(name=dl.get("name", "file"), file=dl["path"])])
             finally:
                 if _lock_acquired:
                     self._active_downloads.pop(dl_key, None)
