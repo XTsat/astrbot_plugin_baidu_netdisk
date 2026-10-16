@@ -14,3 +14,7 @@ tags:
   - 分享
   - qq
   - snowluma
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - qq_official_webhook

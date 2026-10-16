@@ -21,12 +21,12 @@
 | 文件 | 必选 | 职责 |
 |------|------|------|
 | `main.py` | ✅ | 插件主体，全部后端逻辑 |
-| `metadata.yaml` | ✅ | 插件元数据（name、version、author、desc、repo、platform） |
+| `metadata.yaml` | ✅ | 插件元数据（name、version、author、desc、repo、support_platforms） |
 | `_conf_schema.json` | ✅ | WebUI 配置 Schema（定义所有可配置项的类型、默认值、枚举） |
 | `README.md` | ✅ | 中文文档（功能说明、命令表、配置说明、常见问题） |
 | `CHANGELOG.md` | ✅ | 变更日志 |
 | `LICENSE` | ✅ | 许可证（AGPL-3.0） |
-| `logo.png` | ✅ | 插件图标（128×128） |
+| `logo.png` | ✅ | 插件图标（256×256） |
 | `requirements.txt` | 可选 | 运行时依赖（本项目为 `requests>=2.28`） |
 | `.gitignore` | 可选 | Git 忽略规则 |
 

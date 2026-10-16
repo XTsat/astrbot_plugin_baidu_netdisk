@@ -22,7 +22,7 @@ from collections.abc import AsyncGenerator
 import json as _json
 import requests as _req
 
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.message_components import File, Image, Plain
 from astrbot.api.star import Star, Context, register
 from astrbot.api import logger, AstrBotConfig
@@ -326,7 +326,7 @@ except Exception:
     pass  # 首次运行或文件被删，等价于「没保存过代理」
 # 已保存的地址同样要过白名单：防止旧版本/手工改文件留下任意代理
 if _github_proxy and _validate_github_proxy(_github_proxy):
-    logger.warning(f"[baidu_netdisk] 已保存的加速代理不在白名单内，已忽略: {_github_proxy}")
+    logger.warning(f"[baidu_netdisk] ⚠️ 已保存的加速代理不在白名单内，已忽略: {_github_proxy}")
     _github_proxy = ""
 
 
@@ -364,7 +364,7 @@ def _auto_download_bpcs() -> bool:
     if _ensure_bpcs_exe():
         return True
     if _in_cooldown():
-        logger.warning(f"[baidu_netdisk] BaiduPCS-Go 不可用且自动下载刚失败过，"
+        logger.warning(f"[baidu_netdisk] ⚠️ BaiduPCS-Go 不可用且自动下载刚失败过，"
                        f"{_AUTO_DL_RETRY_COOLDOWN_SECONDS // 60} 分钟内跳过重试（管理员可用 /pan pcs 立即手动重试）")
         return False
     with _auto_dl_lock:
@@ -378,7 +378,7 @@ def _auto_download_bpcs() -> bool:
             _auto_dl_failed = True
             _auto_dl_failed_at = time.time()
             _auto_dl_last_error = result["error"]
-            logger.error(f"[baidu_netdisk] BaiduPCS-Go 自动下载失败: {_auto_dl_last_error}")
+            logger.error(f"[baidu_netdisk] ❌ BaiduPCS-Go 自动下载失败: {_auto_dl_last_error}")
             return False
         if result.get("via"):
             logger.info(f"[baidu_netdisk] BaiduPCS-Go 已通过加速镜像 {result['via']} 下载完成")
@@ -428,10 +428,10 @@ def _fetch_release_info(proxy: str = "", timeout: int = 30) -> dict | None:
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
-            logger.error(f"[baidu_netdisk] 获取 GitHub release 信息失败: {e}")
+            logger.error(f"[baidu_netdisk] ❌ 获取 GitHub release 信息失败: {e}")
             return None
     except Exception as e:
-        logger.error(f"[baidu_netdisk] 获取 GitHub release 信息失败: {e}")
+        logger.error(f"[baidu_netdisk] ❌ 获取 GitHub release 信息失败: {e}")
         return None
 
 
@@ -620,7 +620,7 @@ def _init_bpcs() -> bool:
         if _bpcs_inited:
             return True
         if not _ensure_bpcs_exe():
-            logger.warning(f"[baidu_netdisk] {_BPCS_EXE_NAME} 不可用，登录时会自动尝试下载（管理员也可用 /pan pcs 手动下载）")
+            logger.warning(f"[baidu_netdisk] ⚠️ {_BPCS_EXE_NAME} 不可用，登录时会自动尝试下载（管理员也可用 /pan pcs 手动下载）")
             return False
         out, _, code = _run_bpcs(["who"], timeout=15)
         if code == 0 and out and "登录" not in (out or "") and "未登录" not in (out or ""):
@@ -679,12 +679,12 @@ def login_bduss_bpcs(bduss: str, stoken: str = "") -> dict:
     return {"error": f"登录失败（退出码 {code}）: {text.strip()[:200]}"}
 
 
-def _patch_config_stoken(stoken: str, bduss: str = ""):
+def _patch_config_stoken(stoken: str, bduss: str = "") -> None:
     """手动补写 pcs_config.json 中的 stoken 和 bduss 字段。
     login -cookies= 不会自动填充 stoken 字段，但 transfer 需要它。"""
     config_path = _bpcs_config_path()
     if not os.path.exists(config_path):
-        logger.warning(f"[baidu_netdisk] pcs_config.json not found at {config_path}")
+        logger.warning(f"[baidu_netdisk] ⚠️ pcs_config.json not found at {config_path}")
         return
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -699,7 +699,7 @@ def _patch_config_stoken(stoken: str, bduss: str = ""):
             _atomic_write_json(config_path, cfg, indent=4)
             logger.info(f"[baidu_netdisk] patched stoken into config")
     except Exception as e:
-        logger.warning(f"[baidu_netdisk] failed to patch config: {e}")
+        logger.warning(f"[baidu_netdisk] ⚠️ failed to patch config: {e}")
 
 
 def login_cookies_bpcs(cookie_str: str) -> dict:
@@ -753,7 +753,7 @@ def login_bpcs(username: str, password: str) -> dict:
             return {"success": True, "output": text.strip()[:300]}
         logger.info(f"[baidu_netdisk] stdin login 未成功，回退参数方式: rc={proc.returncode}")
     except Exception as e:
-        logger.warning(f"[baidu_netdisk] stdin login 异常，回退参数方式: {e}")
+        logger.warning(f"[baidu_netdisk] ⚠️ stdin login 异常，回退参数方式: {e}")
 
     # 方式二：参数式（兜底）
     out, err, code = _run_bpcs(
@@ -789,7 +789,7 @@ def _build_pan_session() -> object:
     自动访问 pan.baidu.com/disk/main 获取 csrfToken / PANPSC 等 pan 专用 cookie。"""
     cfg_path = _bpcs_config_path()
     if not os.path.exists(cfg_path):
-        logger.warning("[baidu_netdisk] pcs_config.json not found, cannot build pan session")
+        logger.warning("[baidu_netdisk] ⚠️ pcs_config.json not found, cannot build pan session")
         return None
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
@@ -797,10 +797,10 @@ def _build_pan_session() -> object:
         user = cfg.get("baidu_user_list", [{}])[0]
         cookies_str = user.get("cookies", "") or user.get("bduss", "")
         if not cookies_str:
-            logger.warning("[baidu_netdisk] no cookies/bduss in config")
+            logger.warning("[baidu_netdisk] ⚠️ no cookies/bduss in config")
             return None
     except Exception as e:
-        logger.warning(f"[baidu_netdisk] failed to read config: {e}")
+        logger.warning(f"[baidu_netdisk] ⚠️ failed to read config: {e}")
         return None
 
     sess = _req.Session()
@@ -840,7 +840,7 @@ def _grab_share_field(html: str, key: str) -> str:
     return m.group(1) if m else ""
 
 
-def _get_bdstoken(sess) -> str:
+def _get_bdstoken(sess: _req.Session) -> str:
     """通过轻量接口获取 bdstoken（不依赖 /s/ 分享页渲染，分享页故障时仍可用）。"""
     try:
         r = sess.get(
@@ -852,11 +852,11 @@ def _get_bdstoken(sess) -> str:
         if j.get("errno") == 0:
             return (j.get("result") or {}).get("bdstoken", "")
     except Exception as e:
-        logger.warning(f"[baidu_netdisk] gettemplatevariable 失败: {e}")
+        logger.warning(f"[baidu_netdisk] ⚠️ gettemplatevariable 失败: {e}")
     return ""
 
 
-def _resolve_share_via_page(sess, surl: str, share_link: str) -> dict:
+def _resolve_share_via_page(sess: _req.Session, surl: str, share_link: str) -> dict:
     """兜底：从 /s/ 分享页 HTML 解析 shareid / uk / bdstoken。
     仅在 shorturlinfo 网络层失败时使用（分享页服务故障时此路很慢）。"""
     r = None
@@ -874,7 +874,7 @@ def _resolve_share_via_page(sess, surl: str, share_link: str) -> dict:
                 # 用户只看到框架的通用报错，这里转成可读提示
                 logger.warning(f"[baidu_netdisk] ⚠️ 分享页解析兜底失败: {e}")
                 return {"error": f"访问百度网盘失败（{type(e).__name__}），请检查服务器网络后重试"}
-            logger.warning(f"[baidu_netdisk] 分享页请求失败，重试: {e}")
+            logger.warning(f"[baidu_netdisk] ⚠️ 分享页请求失败，重试: {e}")
             time.sleep(1)
     if _grab_share_field(r.text, "loginstate") == "0":
         return {"error": "网盘未登录，请使用 /pan login 1 重新登录"}
@@ -888,7 +888,7 @@ def _resolve_share_via_page(sess, surl: str, share_link: str) -> dict:
     return info
 
 
-def _share_api_preflight(sess, surl: str, pwd: str, share_link: str) -> dict:
+def _share_api_preflight(sess: _req.Session, surl: str, pwd: str, share_link: str) -> dict:
     """转存/列目录的公共前置：shorturlinfo 拿 shareid/uk → gettemplatevariable
     拿 bdstoken → 需要时验证提取码。全程不依赖 /s/ 分享页渲染。
     返回 {"shareid","uk","bdstoken","short"} 或 {"error"}。"""
@@ -908,7 +908,7 @@ def _share_api_preflight(sess, surl: str, pwd: str, share_link: str) -> dict:
             return {"error": f"分享链接无效或已失效（{show}）"}
     except (_req.exceptions.RequestException, ValueError) as e:
         # 仅网络层失败才回退分享页解析（接口明确返回 errno 时链接就是无效的）
-        logger.warning(f"[baidu_netdisk] shorturlinfo 请求失败，回退分享页解析: {e}")
+        logger.warning(f"[baidu_netdisk] ⚠️ shorturlinfo 请求失败，回退分享页解析: {e}")
         page = _resolve_share_via_page(sess, surl, share_link)
         if "error" in page:
             return page
@@ -948,7 +948,7 @@ def _share_api_preflight(sess, surl: str, pwd: str, share_link: str) -> dict:
             "short": surl[1:] if surl.startswith("1") else surl}
 
 
-def _api_dir_list_errno(sess, bdstoken: str, dir_path: str) -> int:
+def _api_dir_list_errno(sess: _req.Session, bdstoken: str, dir_path: str) -> int:
     """查询自己网盘目录是否存在（errno: 0=存在, -9=不存在, 其他=异常）。"""
     try:
         r = sess.get(
@@ -959,11 +959,11 @@ def _api_dir_list_errno(sess, bdstoken: str, dir_path: str) -> int:
             headers={"Referer": "https://pan.baidu.com/disk/main"}, timeout=15)
         return int(r.json().get("errno", -1))
     except Exception as e:
-        logger.warning(f"[baidu_netdisk] api/list 检查目录 {dir_path} 失败: {e}")
+        logger.warning(f"[baidu_netdisk] ⚠️ api/list 检查目录 {dir_path} 失败: {e}")
         return -1
 
 
-def _ensure_remote_dir(sess, bdstoken: str, target_path: str) -> str:
+def _ensure_remote_dir(sess: _req.Session, bdstoken: str, target_path: str) -> str:
     """逐级确保转存目标目录存在（纯 API，不依赖 BaiduPCS-Go）。
 
     百度 share/transfer 对不存在的目标目录返回 errno=2「转存路径不存在」，
@@ -991,11 +991,11 @@ def _ensure_remote_dir(sess, bdstoken: str, target_path: str) -> str:
                          "Content-Type": "application/x-www-form-urlencoded"},
                 timeout=20).json()
         except Exception as e:
-            logger.warning(f"[baidu_netdisk] 创建网盘目录 {cur} 失败: {e}")
+            logger.warning(f"[baidu_netdisk] ⚠️ 创建网盘目录 {cur} 失败: {e}")
             return f"创建网盘目录 {cur} 失败: {e}"
         if r.get("errno") != 0:
             show = r.get("show_msg") or r.get("errno")
-            logger.warning(f"[baidu_netdisk] 创建网盘目录 {cur} 失败: {show}")
+            logger.warning(f"[baidu_netdisk] ⚠️ 创建网盘目录 {cur} 失败: {show}")
             return f"创建网盘目录 {cur} 失败(errno={show})"
         logger.info(f"[baidu_netdisk] 已自动创建网盘转存目录: {cur}")
     return ""
@@ -1076,7 +1076,7 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str, fs_ids: list = None
             # 直接放行，导致后续下载报误导性的「路径不存在」。此处如实报错。
             # 注：百度对「不能转存自己的分享」也可能返回 errno=2。
             show = (resp5.get("show_msg") or "").strip()
-            logger.warning(f"[baidu_netdisk] transfer errno=2, show_msg={show or '(空)'}")
+            logger.warning(f"[baidu_netdisk] ⚠️ transfer errno=2, show_msg={show or '(空)'}")
             if "路径不存在" in show or "不存在" in show:
                 return {"error": f"转存失败：目标目录 {target_path} 创建失败或不存在（{show}）"}
             return {"error": f"转存失败(errno=2): {show or '不能转存自己的分享（同一账号限制）'}。"
@@ -1160,7 +1160,7 @@ def _cleanup_local_dir() -> None:
         logger.info(f"[baidu_netdisk] local cleanup: removed {removed} plugin-downloaded files")
 
 
-def _schedule_local_cleanup(hour: int):
+def _schedule_local_cleanup(hour: int) -> None:
     """安排每天定时清理本地下载文件（仅清理插件自己下载的文件）。"""
     global _cleanup_thread_started
     if hour < 0 or hour > 23:
@@ -1171,7 +1171,7 @@ def _schedule_local_cleanup(hour: int):
         return
     _cleanup_thread_started = True
 
-    def _worker():
+    def _worker() -> None:
         while True:
             now = time.localtime()
             target = time.mktime((now.tm_year, now.tm_mon, now.tm_mday,
@@ -1258,7 +1258,7 @@ _BPCS_LS_RE = re.compile(
 )
 
 
-def _parse_ls_line(line: str):
+def _parse_ls_line(line: str) -> tuple[str, str, bool] | None:
     """解析 BPCS ls -l 的一行文件记录。
     返回 (name, size_raw, is_dir)，非文件行返回 None。
     按日期列定位文件名起点，支持文件名含空格。"""
@@ -1298,7 +1298,7 @@ def _list_share_tree_api(surl: str, pwd: str) -> dict:
     lines, items = [], []
     state = {"truncated": False}
 
-    def _walk(dir_rel: str, api_dir: str, depth: int):
+    def _walk(dir_rel: str, api_dir: str, depth: int) -> None:
         if len(items) >= _TREE_MAX_ITEMS:
             state["truncated"] = True
             return
@@ -1320,10 +1320,10 @@ def _list_share_tree_api(surl: str, pwd: str) -> dict:
             lst = j.get("list") or []
             if j.get("errno") != 0 and dir_rel:
                 lines.append(f"{'  ' * depth}⚠️ 子目录 {dir_rel} 获取失败(errno={j.get('errno')})")
-                logger.warning(f"[baidu_netdisk] share/list {dir_rel} errno={j.get('errno')}")
+                logger.warning(f"[baidu_netdisk] ⚠️ share/list {dir_rel} errno={j.get('errno')}")
                 return
         except Exception as e:
-            logger.warning(f"[baidu_netdisk] share/list {dir_rel or '根目录'} 失败: {e}")
+            logger.warning(f"[baidu_netdisk] ⚠️ share/list {dir_rel or '根目录'} 失败: {e}")
             return
         prefix = "  " * depth
         shown = 0
@@ -1368,7 +1368,7 @@ def list_share_content(surl: str, pwd: str = "") -> dict:
     result = _list_share_tree_api(surl, pwd)
     if "error" in result:
         return result
-    return {"text": result["text"], "items": result["items"], "own_share": False}
+    return {"text": result["text"], "items": result["items"]}
 
 
 def _user_bucket(user_id: str) -> str:
@@ -1544,7 +1544,7 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
             out = out.decode("utf-8", errors="replace")
         code = proc.returncode
     except subprocess.TimeoutExpired:
-        logger.error(f"[baidu_netdisk] download timeout ({dl_timeout}s), killing process")
+        logger.error(f"[baidu_netdisk] ❌ download timeout ({dl_timeout}s), killing process")
         # 超时后必须 kill，否则 BPCS 会继续在后台下载
         proc.kill()
         try:
@@ -1555,10 +1555,10 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
             progress_queue.put(("_error", "下载超时"))
         return {"error": "下载超时"}
     except Exception as e:
-        logger.error(f"[baidu_netdisk] download subprocess error: {e}")
+        logger.error(f"[baidu_netdisk] ❌ download subprocess error: {e}")
         return {"error": f"下载进程异常: {e}"}
     if code != 0 or "失败" in (out or "") or "错误" in (out or ""):
-        logger.error(f"[baidu_netdisk] download failed: code={code}, out={(out or '')[:200]}")
+        logger.error(f"[baidu_netdisk] ❌ download failed: code={code}, out={(out or '')[:200]}")
         if progress_queue is not None:
             progress_queue.put(("_error", f"下载失败 (code={code})"))
         return {"error": "下载失败"}
@@ -1723,7 +1723,7 @@ class BaiduNetdiskPlugin(Star):
 
     _SHARE_CACHE_MAX_USERS = 50  # 分享缓存最多保留多少个用户，避免长期运行后无限增长
 
-    def __init__(self, context: Context, config: AstrBotConfig = None):
+    def __init__(self, context: Context, config: AstrBotConfig = None) -> None:
         super().__init__(context)
         self.config = config or {}
 
@@ -1736,7 +1736,7 @@ class BaiduNetdiskPlugin(Star):
         try:
             os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         except Exception as e:
-            logger.warning(f"[baidu_netdisk] 配置的 download_dir ({DOWNLOAD_DIR}) 不可用 ({e})，回退到默认路径")
+            logger.warning(f"[baidu_netdisk] ⚠️ 配置的 download_dir ({DOWNLOAD_DIR}) 不可用 ({e})，回退到默认路径")
             DOWNLOAD_DIR = os.path.join(PLUGIN_DATA_DIR, "downloads")
             os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         logger.info(f"[baidu_netdisk] download dir: {DOWNLOAD_DIR}")
@@ -1761,7 +1761,7 @@ class BaiduNetdiskPlugin(Star):
         if _ensure_bpcs_exe():
             _run_bpcs(["config", "set", "-savedir", DOWNLOAD_DIR], timeout=15)
         else:
-            logger.warning(f"[baidu_netdisk] {_BPCS_EXE_NAME} 不可用，首次登录时会自动下载，配置将在下载后生效")
+            logger.warning(f"[baidu_netdisk] ⚠️ {_BPCS_EXE_NAME} 不可用，首次登录时会自动下载，配置将在下载后生效")
 
         # 解析黑名单
         bl = str(self.config.get("blacklist", "")).strip()
@@ -1803,11 +1803,11 @@ class BaiduNetdiskPlugin(Star):
         if bduss_val:
             threading.Thread(target=self._auto_login_bduss, args=(bduss_val,), daemon=True).start()
 
-    def _auto_login_bduss(self, bduss: str):
+    def _auto_login_bduss(self, bduss: str) -> None:
         time.sleep(2)  # 等待 _init_bpcs 先跑完
         result = login_bduss_bpcs(bduss, "")
         if "error" in result:
-            logger.warning(f"[baidu_netdisk] bduuss 配置自动登录失败: {result['error']}")
+            logger.warning(f"[baidu_netdisk] ⚠️ bduuss 配置自动登录失败: {result['error']}")
         else:
             logger.info("[baidu_netdisk] bduuss 配置自动登录成功")
 
@@ -1821,7 +1821,7 @@ class BaiduNetdiskPlugin(Star):
         """读取该用户的分享缓存（不写入，避免只读操作撑大缓存）。"""
         return self._share_cache.get(user_id) or {"surl": "", "pwd": "", "tree": "", "items": []}
 
-    def _cache_put(self, user_id: str, surl: str, pwd: str, tree: str, items: list):
+    def _cache_put(self, user_id: str, surl: str, pwd: str, tree: str, items: list) -> None:
         """写入该用户的分享缓存；缓存按使用者数量封顶，超出的淘汰最早写入的那个。"""
         self._share_cache.pop(user_id, None)  # 先删再插，保持字典顺序=最近使用
         self._share_cache[user_id] = {"surl": surl, "pwd": pwd, "tree": tree, "items": items}
@@ -1918,7 +1918,7 @@ class BaiduNetdiskPlugin(Star):
         return "", (text_pwd or pwd)
 
     @staticmethod
-    async def _interruptible_sleep(fut: asyncio.Future, seconds: int):
+    async def _interruptible_sleep(fut: asyncio.Future, seconds: int) -> None:
         """分段休眠，长间隔下也能及时感知下载完成。"""
         for _ in range(max(1, int(seconds))):
             if fut.done():
@@ -1959,9 +1959,8 @@ class BaiduNetdiskPlugin(Star):
 
         # 自动检测平台，优先于配置
         platform = getattr(event.platform_meta, "name", "") if event.platform_meta else ""
-        platform_id = getattr(event, "platform_identifier", "") or ""
-        logger.info(f"[baidu_netdisk] _send_file: platform={platform}, platform_id={platform_id}")
-        if platform == "qq_official" or "qq_official" in platform_id or "qq_official" in platform:
+        logger.info(f"[baidu_netdisk] _send_file: platform={platform}")
+        if "qq_official" in platform:
             logger.info(f"[baidu_netdisk] _send_file: detected qq_official, using _send_official")
             return await self._send_official(event, file_path, name, size_mb, share_url)
 
@@ -1982,7 +1981,7 @@ class BaiduNetdiskPlugin(Star):
             logger.info(f"[baidu_netdisk] _send_onebot: direct send success")
             return True
         except Exception as e2:
-            logger.warning(f"[baidu_netdisk] _send_onebot: direct send failed: {e2}")
+            logger.warning(f"[baidu_netdisk] ⚠️ _send_onebot: direct send failed: {e2}")
             # 兜底：发送链接
             msg = f"⚠️ 文件 {size_mb:.1f}MB 发送失败"
             if share_url:
@@ -2000,7 +1999,7 @@ class BaiduNetdiskPlugin(Star):
             await event.send(MessageChain(chain=[File(name=name, file=file_path)]))
             return True
         except Exception as e:
-            logger.warning(f"[baidu_netdisk] send file failed: {e}")
+            logger.warning(f"[baidu_netdisk] ⚠️ send file failed: {e}")
             msg = "⚠️ 文件发送失败"
             if share_url:
                 msg += f"，请自行下载: {share_url}"
@@ -2020,7 +2019,7 @@ class BaiduNetdiskPlugin(Star):
                 await event.send(MessageChain(chain=[File(name=name, file=file_path)]))
                 return True
             except Exception as e:
-                logger.warning(f"[baidu_netdisk] _send_official: send failed: {e}")
+                logger.warning(f"[baidu_netdisk] ⚠️ _send_official: send failed: {e}")
                 return False
 
         logger.info(f"[baidu_netdisk] _send_official: file > limit, returning link")
@@ -2062,9 +2061,7 @@ class BaiduNetdiskPlugin(Star):
 
         # 打包 zip 前先判断体积，避免压缩完才发现发不动（白占磁盘/耗时）
         platform = getattr(event.platform_meta, "name", "") if event.platform_meta else ""
-        platform_id = getattr(event, "platform_identifier", "") or ""
-        is_official = (platform == "qq_official" or "qq_official" in platform_id
-                       or "qq_official" in platform or self._get_send_mode() == "official")
+        is_official = "qq_official" in platform or self._get_send_mode() == "official"
         size_text = _format_size(str(total_bytes))
         if is_official and total_bytes > FLASH_TASK_LIMIT_MB * 1024 * 1024:
             return await self._folder_fallback(
@@ -2082,7 +2079,7 @@ class BaiduNetdiskPlugin(Star):
                     f"⚠️ 打包需约 {_format_size(str(total_bytes))} 临时空间，当前可用 {_format_size(str(free))}，空间不足未打包",
                     subject, notify)
         except Exception as e:
-            logger.warning(f"[baidu_netdisk] _send_folder: 磁盘空间检查失败: {e}")
+            logger.warning(f"[baidu_netdisk] ⚠️ _send_folder: 磁盘空间检查失败: {e}")
 
         safe_name = re.sub(r'[\\/:*?"<>|]+', "_", folder_name).strip() or "folder"
         zip_name = f"{safe_name}.zip"
@@ -2129,7 +2126,7 @@ class BaiduNetdiskPlugin(Star):
         return text
 
     @filter.llm_tool(name="pan_list")
-    async def pan_list(self, event: AstrMessageEvent, link: str, pwd: str = ""):
+    async def pan_list(self, event: AstrMessageEvent, link: str, pwd: str = "") -> str:
         """查看百度网盘分享链接的目录结构。用户说"查一下这个百度网盘链接"、"看看里面有什么文件"时调用。
         特大分享（TB级）也能正常查看（只读目录，不转存、不占网盘空间）。
         超大目录树最多展示3层/约300项，超出部分会在末尾提示；下载更深层的内容时把已知路径传给下载工具即可。
@@ -2158,7 +2155,7 @@ class BaiduNetdiskPlugin(Star):
                 f"后续转存/下载结果都在这两个目录下）")
 
     @filter.llm_tool(name="pan_download_dir")
-    async def pan_download_dir(self, event: AstrMessageEvent, folder_path: str, link: str = "", pwd: str = ""):
+    async def pan_download_dir(self, event: AstrMessageEvent, folder_path: str, link: str = "", pwd: str = "") -> str:
         """下载百度网盘分享中的文件夹或单个文件。用户说"下载xxx文件夹"、"下载xxx里面的xxx文件夹"、"下载xxx这个文件"时调用。
         folder_path 必须与 pan_list 返回的目录树中显示的路径完全一致（从分享根目录第一层开始，如 "初中资料/2025万唯"），不要自创或省略层级。如果还没查看过目录树，先调用 pan_list。
         工具只转存选中项（需要网盘剩余空间大于该项大小）然后下载。若返回"空间不足"等错误，如实告诉用户原因，并建议挑选更小的文件/文件夹分批下载。
@@ -2190,7 +2187,7 @@ class BaiduNetdiskPlugin(Star):
 
         dl_key = f"tool:pan_download_dir:{uid}:{folder_path}"
         if dl_key in self._active_downloads:
-            logger.warning(f"[baidu_netdisk] pan_download_dir: duplicate blocked: {dl_key}")
+            logger.warning(f"[baidu_netdisk] ⚠️ pan_download_dir: duplicate blocked: {dl_key}")
             return "⏳ 该文件正在下载中，请稍候..."
         self._active_downloads[dl_key] = uid
         try:
@@ -2242,7 +2239,7 @@ class BaiduNetdiskPlugin(Star):
             self._active_downloads.pop(dl_key, None)
 
     @filter.llm_tool(name="pan_download_all")
-    async def pan_download_all(self, event: AstrMessageEvent, link: str = "", pwd: str = ""):
+    async def pan_download_all(self, event: AstrMessageEvent, link: str = "", pwd: str = "") -> str:
         """下载百度网盘分享中的所有文件。用户说"全部下载"、"下载所有文件"、"都下载"时调用。
         注意：需要网盘剩余空间大于分享总大小；特大分享（TB级）会转存失败并返回空间不足提示，此时应引导用户改用 pan_download_dir 挑选需要的文件夹或文件分批下载。
         下载完成后文件保存在本地下载目录（后台配置的 download_dir）下的 <账号uid_用户名>/ 子目录里，实际完整路径以工具返回值为准，回复用户时原样告知。
@@ -2272,7 +2269,7 @@ class BaiduNetdiskPlugin(Star):
 
         dl_key = f"tool:pan_download_all:{uid}"
         if dl_key in self._active_downloads:
-            logger.warning(f"[baidu_netdisk] pan_download_all: duplicate blocked: {dl_key}")
+            logger.warning(f"[baidu_netdisk] ⚠️ pan_download_all: duplicate blocked: {dl_key}")
             return "⏳ 该文件正在下载中，请稍候..."
         self._active_downloads[dl_key] = uid
         try:
@@ -2311,7 +2308,7 @@ class BaiduNetdiskPlugin(Star):
             self._active_downloads.pop(dl_key, None)
 
     @filter.llm_tool(name="pan_transfer")
-    async def pan_transfer(self, event: AstrMessageEvent, link: str = "", pwd: str = "", path: str = ""):
+    async def pan_transfer(self, event: AstrMessageEvent, link: str = "", pwd: str = "", path: str = "") -> str:
         """把百度网盘分享中的文件或文件夹转存到自己的网盘（不下载到本地）。用户说"转存一下"、"存到我的网盘"、"先转存"时调用。
         path 传 pan_list 目录树中显示的路径则只转存该项（需要网盘剩余空间大于该项大小）；不传 path 则转存分享根目录的全部内容（特大分享会因空间不足失败）。
         转存结果在网盘的暂存目录下（<配置的转存目录>/<该用户的隔离子目录>），回复用户时把转存到的完整网盘路径一起告诉用户。
@@ -2353,7 +2350,7 @@ class BaiduNetdiskPlugin(Star):
         names = "、".join(tr.get("filenames", [])[:10]) or "全部内容"
         return f"✅ 已转存（{names}）到网盘 {cloud_dir}"
 
-    async def _login_flow(self, event: AstrMessageEvent, username: str, password: str):
+    async def _login_flow(self, event: AstrMessageEvent, username: str, password: str) -> AsyncGenerator[MessageEventResult, None]:
         """/pan login 2/pwd 子命令：账密登录，全局生效"""
         if not event.is_private_chat():
             yield event.plain_result("⚠️ 密码会出现在聊天记录中，建议私聊执行以防泄露")
@@ -2376,7 +2373,7 @@ class BaiduNetdiskPlugin(Star):
             "0  退出登录    /pan login 0  或  /pan login out"
         )
 
-    async def _login_dispatch(self, event: AstrMessageEvent, parts: list):
+    async def _login_dispatch(self, event: AstrMessageEvent, parts: list) -> AsyncGenerator[MessageEventResult, None]:
         """/pan login <方式> [参数]：统一登录入口，负责分发到具体登录/退出流程。"""
         if len(parts) < 2 or parts[1].lower() in ("help", "-h"):
             yield event.plain_result(self._login_menu())
@@ -2444,7 +2441,7 @@ class BaiduNetdiskPlugin(Star):
         yield event.plain_result(f"未知的登录方式: {parts[1]}")
         yield event.plain_result(self._login_menu())
 
-    async def _qrlogin_flow(self, event: AstrMessageEvent):
+    async def _qrlogin_flow(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
         """/pan login 1/qr 子命令：扫码登录全流程（生成二维码 → 展示 → 轮询确认 → 注入凭证），全局生效"""
         sess = _req.Session()
         sess.headers.update({"User-Agent": _BROWSER_UA, "Accept-Language": "zh-CN,zh;q=0.9"})
@@ -2570,7 +2567,7 @@ class BaiduNetdiskPlugin(Star):
         yield event.plain_result("❌ 二维码已超时，请重新发送 /pan login 1")
 
     @filter.command("pan", "下载百度网盘分享文件")
-    async def on_pan(self, event: AstrMessageEvent, args: GreedyStr):
+    async def on_pan(self, event: AstrMessageEvent, args: GreedyStr) -> AsyncGenerator[MessageEventResult, None]:
         """用法: /pan <链接或surl> [提取码]  |  /pan login 查看登录/退出菜单"""
 
         if self._is_blacklisted(event):
@@ -2594,12 +2591,6 @@ class BaiduNetdiskPlugin(Star):
                 "/pan pcs off  清除已保存的加速代理",
             ]
             yield event.plain_result("\n".join(help_lines))
-            sponsor_path = os.path.join(os.path.dirname(__file__), "sponsor.png")
-            if os.path.exists(sponsor_path):
-                yield event.chain_result([
-                    Plain("支持作者↑↑↑"),
-                    Image.fromFileSystem(sponsor_path)
-                ])
             return
 
         if parts[0].lower() == "pcs":
@@ -2708,7 +2699,7 @@ class BaiduNetdiskPlugin(Star):
             dl_path = " ".join(parts[1:])
             # 下载锁检查
             if dl_key in self._active_downloads:
-                logger.warning(f"[baidu_netdisk] on_pan: duplicate download blocked: {dl_key}")
+                logger.warning(f"[baidu_netdisk] ⚠️ on_pan: duplicate download blocked: {dl_key}")
                 yield event.plain_result("⏳ 该文件正在下载中，请稍候...")
                 return
             self._active_downloads[dl_key] = uid
@@ -2785,7 +2776,7 @@ class BaiduNetdiskPlugin(Star):
                         dl = await dl_future
                     logger.info(f"[baidu_netdisk] on_pan down: download complete, dl={dl}")
                     if "error" in dl:
-                        logger.error(f"[baidu_netdisk] on_pan down: download error: {dl['error']}")
+                        logger.error(f"[baidu_netdisk] ❌ on_pan down: download error: {dl['error']}")
                         yield event.plain_result(f"❌ {dl['error']}")
                     else:
                         share_url = f"https://pan.baidu.com/s/{self._cache_get(uid)['surl']}"
