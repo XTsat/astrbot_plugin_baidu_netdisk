@@ -171,6 +171,38 @@ async def _download_slot() -> AsyncGenerator[bool, None]:
             sem.release()
 
 
+# ---- 文件写入 ----
+
+_FILE_WRITE_LOCK = threading.Lock()  # 写入方可能在下载工作线程里，故用线程锁而非 asyncio.Lock
+
+
+def _atomic_write(path: str, text: str) -> None:
+    """原子写入文本：先写同目录的 .tmp，再 os.replace 覆盖目标文件。
+
+    直接 open(..., "w") 会先把原文件截断再逐块写：进程在写入途中被中断（重启、OOM）
+    就会留下半个文件，下次读取直接解析失败。"""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp = f"{path}.tmp"
+    with _FILE_WRITE_LOCK:
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except OSError:
+            # 写失败时清掉半截临时文件；原文件因尚未 replace 而保持完整
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
+
+
+def _atomic_write_json(path: str, data: object, indent: int = 2) -> None:
+    """原子写入 JSON（UTF-8、保留中文可读）。"""
+    _atomic_write(path, _json.dumps(data, ensure_ascii=False, indent=indent))
+
+
 def _resolve_plugin_data_dir() -> str:
     """解析 AstrBot 的 plugin-data 目录（data/plugin_data/<插件目录名>/）。
     优先走官方 StarTools.get_data_dir()；兼容旧版 AstrBot 时回退到 astrbot_path 推导；
@@ -180,14 +212,14 @@ def _resolve_plugin_data_dir() -> str:
         from astrbot.core.star.star_tools import StarTools
         return str(StarTools.get_data_dir(plugin_dir_name))
     except Exception:
-        pass
+        pass  # 旧版 AstrBot 没有 StarTools，继续走下面的兼容路径
     try:
         import astrbot.core.utils.astrbot_path as _ap
         d = os.path.join(_ap.get_astrbot_plugin_data_path(), plugin_dir_name)
         os.makedirs(d, exist_ok=True)
         return d
     except Exception:
-        pass
+        pass  # 连 astrbot_path 也不可用（非标准部署），最后回退到插件目录
     d = os.path.join(os.path.dirname(__file__), "plugin_data")
     os.makedirs(d, exist_ok=True)
     return d
@@ -214,6 +246,8 @@ _DOWNLOAD_HARD_CAP_SECONDS = 12 * 3600
 
 # 本插件下载过的本地文件清单，定时清理时只删这些，不动下载目录里的其他文件
 _MANIFEST_PATH = os.path.join(PLUGIN_DATA_DIR, "cleanup_manifest.json")
+# 清单的读-改-写锁：下载完成登记与定时清理都跑在工作线程里，必须用线程锁
+_MANIFEST_LOCK = threading.Lock()
 
 _bpcs_inited = False
 _bpcs_lock = threading.Lock()
@@ -286,9 +320,10 @@ def _mirror_candidates() -> tuple:
 _GITHUB_PROXY_FILE = os.path.join(PLUGIN_DATA_DIR, "github_proxy.txt")
 _github_proxy = ""
 try:
-    _github_proxy = (open(_GITHUB_PROXY_FILE, "r", encoding="utf-8").read() or "").strip()
+    with open(_GITHUB_PROXY_FILE, "r", encoding="utf-8") as f:
+        _github_proxy = (f.read() or "").strip()
 except Exception:
-    pass
+    pass  # 首次运行或文件被删，等价于「没保存过代理」
 # 已保存的地址同样要过白名单：防止旧版本/手工改文件留下任意代理
 if _github_proxy and _validate_github_proxy(_github_proxy):
     logger.warning(f"[baidu_netdisk] 已保存的加速代理不在白名单内，已忽略: {_github_proxy}")
@@ -370,11 +405,9 @@ def _set_github_proxy(proxy: str) -> str | None:
         return err
     _github_proxy = proxy
     try:
-        os.makedirs(PLUGIN_DATA_DIR, exist_ok=True)
-        with open(_GITHUB_PROXY_FILE, "w", encoding="utf-8") as f:
-            f.write(proxy)
-    except Exception as e:
-        logger.warning(f"[baidu_netdisk] 保存 GitHub 加速代理失败（{e}），本次会话内仍生效")
+        _atomic_write(_GITHUB_PROXY_FILE, proxy)
+    except OSError as e:
+        logger.warning(f"[baidu_netdisk] ⚠️ 保存 GitHub 加速代理失败（{e}），本次会话内仍生效")
     return None
 
 
@@ -662,8 +695,8 @@ def _patch_config_stoken(stoken: str, bduss: str = ""):
                 user_list[0]["stoken"] = stoken
             if bduss:
                 user_list[0]["bduss"] = bduss
-            with open(config_path, "w", encoding="utf-8") as f:
-                _json.dump(cfg, f, ensure_ascii=False, indent=4)
+            # 这份配置 BaiduPCS-Go 自己也会读写，保持 indent=4 以免两边来回改格式
+            _atomic_write_json(config_path, cfg, indent=4)
             logger.info(f"[baidu_netdisk] patched stoken into config")
     except Exception as e:
         logger.warning(f"[baidu_netdisk] failed to patch config: {e}")
@@ -794,8 +827,9 @@ def _build_pan_session() -> object:
     # 访问 pan.baidu.com 获取 pan 专用 cookie（csrfToken / PANPSC）
     try:
         sess.get("https://pan.baidu.com/disk/main", timeout=10)
-    except Exception:
-        pass
+    except Exception as e:
+        # 预热只为拿 pan 专用 cookie，失败不致命：后续请求仍会用已有 cookie 继续尝试
+        logger.warning(f"[baidu_netdisk] ⚠️ 预热 pan cookie 失败: {e}")
     return sess
 
 
@@ -1084,41 +1118,44 @@ def _manifest_load() -> set:
         return set()
 
 
-def _manifest_save(paths: set):
+def _manifest_save(paths: set) -> None:
     try:
-        os.makedirs(os.path.dirname(_MANIFEST_PATH), exist_ok=True)
-        with open(_MANIFEST_PATH, "w", encoding="utf-8") as f:
-            _json.dump({"files": sorted(paths)}, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning(f"[baidu_netdisk] save cleanup manifest failed: {e}")
+        _atomic_write_json(_MANIFEST_PATH, {"files": sorted(paths)})
+    except OSError as e:
+        logger.warning(f"[baidu_netdisk] ⚠️ save cleanup manifest failed: {e}")
 
 
-def _manifest_add(paths: list):
+def _manifest_add(paths: list) -> None:
     """登记插件下载到本地的文件，供定时清理使用。"""
     new = {p for p in paths if p}
     if not new:
         return
-    _manifest_save(_manifest_load() | new)
+    # 读-改-写必须整体串行：两个并发下载各自「读到旧清单再写回」会丢掉对方刚登记的文件，
+    # 那些文件从此不再被定时清理（磁盘只增不减，且没有任何提示）
+    with _MANIFEST_LOCK:
+        _manifest_save(_manifest_load() | new)
 
 
-def _cleanup_local_dir():
+def _cleanup_local_dir() -> None:
     """清理本插件下载并登记过的本地文件（不会动下载目录里的其他文件）。"""
-    paths = _manifest_load()
-    if not paths:
-        return
-    removed = 0
-    remain = set()
-    for p in paths:
-        try:
-            if os.path.isfile(p):
-                os.remove(p)
-                removed += 1
-            elif os.path.exists(p):
-                remain.add(p)  # 目录等非普通文件，保留不动
-        except Exception as e:
-            logger.warning(f"[baidu_netdisk] cleanup skip {p}: {e}")
-            remain.add(p)
-    _manifest_save(remain)
+    # 全程持锁：删除过程中若有下载完成并登记新文件，会被这里的旧快照覆盖而丢失
+    with _MANIFEST_LOCK:
+        paths = _manifest_load()
+        if not paths:
+            return
+        removed = 0
+        remain = set()
+        for p in paths:
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+                    removed += 1
+                elif os.path.exists(p):
+                    remain.add(p)  # 目录等非普通文件，保留不动
+            except OSError as e:
+                logger.warning(f"[baidu_netdisk] ⚠️ cleanup skip {p}: {e}")
+                remain.add(p)
+        _manifest_save(remain)
     if removed:
         logger.info(f"[baidu_netdisk] local cleanup: removed {removed} plugin-downloaded files")
 
@@ -1513,7 +1550,7 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
         try:
             proc.communicate(timeout=10)
         except Exception:
-            pass
+            pass  # 已 kill 过，收尾失败不影响返回「下载超时」
         if progress_queue is not None:
             progress_queue.put(("_error", "下载超时"))
         return {"error": "下载超时"}
@@ -1655,7 +1692,7 @@ def _get_account_folder() -> str:
         if uid and name:
             return f"{uid}_{name}"
     except Exception:
-        pass
+        pass  # 读不到就退化成不带名字的隔离目录，不影响下载
     return ""
 
 
@@ -1952,8 +1989,9 @@ class BaiduNetdiskPlugin(Star):
                 msg += f"。请自行下载: {share_url}"
             try:
                 await event.send(MessageChain(chain=[Plain(msg)]))
-            except Exception:
-                pass
+            except Exception as e:
+                # 兜底提示本身发不出去时用户将完全没有反馈，至少留下日志便于排查
+                logger.warning(f"[baidu_netdisk] ⚠️ 发送降级提示失败: {e}；内容: {msg}")
             return False
 
     async def _send_other(self, event: AstrMessageEvent, file_path: str, name: str, size_mb: float, share_url: str = "") -> bool:
@@ -1968,8 +2006,9 @@ class BaiduNetdiskPlugin(Star):
                 msg += f"，请自行下载: {share_url}"
             try:
                 await event.send(MessageChain(chain=[Plain(msg)]))
-            except Exception:
-                pass
+            except Exception as e2:
+                # 兜底提示本身发不出去时用户将完全没有反馈，至少留下日志便于排查
+                logger.warning(f"[baidu_netdisk] ⚠️ 发送降级提示失败: {e2}；内容: {msg}")
             return False
 
     async def _send_official(self, event: AstrMessageEvent, file_path: str, name: str, size_mb: float, share_url: str = "") -> bool:
@@ -1990,8 +2029,9 @@ class BaiduNetdiskPlugin(Star):
             msg += f"，请自行下载: {share_url}"
         try:
             await event.send(MessageChain(chain=[Plain(msg)]))
-        except Exception:
-            pass
+        except Exception as e:
+            # 兜底提示本身发不出去时用户将完全没有反馈，至少留下日志便于排查
+            logger.warning(f"[baidu_netdisk] ⚠️ 发送降级提示失败: {e}；内容: {msg}")
         return False
 
     async def _send_folder(self, event: AstrMessageEvent, dl: dict, share_url: str = "",
@@ -2061,7 +2101,7 @@ class BaiduNetdiskPlugin(Star):
             try:
                 os.remove(z["path"])
             except OSError:
-                pass
+                pass  # 临时 zip 可能已被上一轮清理删除
         if sent_ok:
             return f"✅ {subject} 下载完成，已打包为 {zip_name} 发送（共 {count} 个文件）"
         return await self._folder_fallback(event, dl, "⚠️ zip 发送失败，未发送", subject, notify)
@@ -2176,7 +2216,7 @@ class BaiduNetdiskPlugin(Star):
                                 elif isinstance(msg, str):
                                     await event.send(event.plain_result(msg))
                             except queue.Empty:
-                                pass
+                                pass  # 本轮没取到进度消息，继续轮询
                             if file_info and not dl_future.done():
                                 fname, total = file_info
                                 current = _get_local_file_size(fname)
@@ -2258,7 +2298,7 @@ class BaiduNetdiskPlugin(Star):
                                 elif isinstance(msg, str):
                                     await event.send(event.plain_result(msg))
                             except queue.Empty:
-                                pass
+                                pass  # 本轮没取到进度消息，继续轮询
                             await self._interruptible_sleep(dl_future, self._progress_interval)
                     dl = await dl_future
                 if "error" in dl:
@@ -2500,8 +2540,9 @@ class BaiduNetdiskPlugin(Star):
                     await asyncio.to_thread(
                         lambda: sess.get("https://pan.baidu.com/disk/main", timeout=10)
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    # 预热只为补 pan 专用 cookie，失败时仍用已拿到的 cookie 继续登录
+                    logger.warning(f"[baidu_netdisk] ⚠️ 登录后预热 pan cookie 失败: {e}")
                 # 从 session 的 cookie jar 提取全部 cookie（已含 pan 专用 cookie）
                 full_cookie = "; ".join(f"{k}={cv2}" for k, cv2 in sess.cookies.items())
                 logger.info(f"[baidu_netdisk] qrlogin cookie keys: {list(sess.cookies.keys())}")
@@ -2594,7 +2635,7 @@ class BaiduNetdiskPlugin(Star):
                     try:
                         os.remove(_GITHUB_PROXY_FILE)
                     except OSError:
-                        pass
+                        pass  # 本来就没保存过代理
                     yield event.plain_result("🗑️ 已清除已保存的加速代理，回到自动挑选可用加速镜像的下载方式。")
                 elif arg2.lower().startswith(("http://", "https://")):
                     # 保存并走指定加速代理下载
@@ -2706,7 +2747,7 @@ class BaiduNetdiskPlugin(Star):
                                     elif isinstance(msg, str):
                                         yield event.plain_result(msg)
                                 except queue.Empty:
-                                    pass
+                                    pass  # 本轮没取到进度消息，继续轮询
                                 # 监控本地文件大小
                                 if file_info and not dl_future.done():
                                     fname, total = file_info
