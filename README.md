@@ -2,12 +2,18 @@
 <h1>百度网盘下载</h1>
 <p><strong>百度网盘分享自动下载并发送。登录后全员都可使用。</strong></p>
 <p><sub>百度网盘 &nbsp;&nbsp; 下载分享 &nbsp;&nbsp; QQ &nbsp;&nbsp; Astrbot</sub></p>
+<p>
+<a href="https://github.com/XTsat/astrbot_plugin_baidu_netdisk/tags"><img src="https://img.shields.io/github/v/tag/XTsat/astrbot_plugin_baidu_netdisk?label=version&color=blue" alt="version"></a>
+<a href="https://github.com/XTsat/astrbot_plugin_baidu_netdisk/blob/master/LICENSE"><img src="https://img.shields.io/github/license/XTsat/astrbot_plugin_baidu_netdisk?label=license&color=green" alt="license"></a>
+<img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue" alt="platform">
+</p>
 </div>
 
 ## 一、功能
 
 - **共享会员**：一个百度账号登录后，全群成员共享高速下载能力，无需人人开通网盘会员
 - **特大分享可用**：TB 级分享也能正常浏览目录，下载时只转存选中的文件/文件夹，网盘剩余空间不大也能用
+- **全平台可用**：Windows、Linux、macOS 均可部署，x64 / arm64 自动匹配
 - **目录查看与按需下载**：查看分享目录树，按需下载文件夹或单个文件
 - **文件夹自动发送**：QQ 等平台不能直接发送文件夹，插件会自动处理
 - **LLM 工具**：`pan_list` / `pan_transfer` / `pan_download_dir` / `pan_download_all`，AI 自动识别网盘链接并执行查看/转存/下载
