@@ -40,8 +40,6 @@ BPCS_PATH = os.path.join(os.path.dirname(__file__), _BPCS_EXE_NAME)
 # BaiduPCS-Go 官方 release 信息：始终拉取 GitHub 最新 release（不固定版本号/资产名，下载 URL 与大小由 API 实时提供）
 BPCS_REPO = "qjfoidnh/BaiduPCS-Go"
 BPCS_API_URL = f"https://api.github.com/repos/{BPCS_REPO}/releases/latest"
-# 国内镜像直链（固定 v4.0.1，仅在 GitHub 不可达时兜底；不做哈希校验；镜像仅提供 Windows 版）
-BPCS_CN_URL = "https://www.now61.cn/f/0pb4TV/BaiduPCS-Go.exe"
 
 
 def _bpcs_asset_suffix() -> str | None:
@@ -146,7 +144,57 @@ _cleanup_thread_started = False
 _share_switch_lock = threading.Lock()  # 串行化“切换分享链接”（rm 旧转存 + 转存新链接 + 更新缓存）
 _auto_dl_lock = threading.Lock()  # 串行化登录时的自动下载（同一时间只允许一个下载任务）
 _auto_dl_failed = False  # 自动下载失败缓存标记：避免 exe 缺失且网络不通时每次登录都长时间重试；/pan pcs 会重置
-_auto_dl_last_error = ""  # 最近一次自动下载失败的具体原因（GitHub/国内镜像各自的错误），用于给用户可诊断的失败提示
+_auto_dl_last_error = ""  # 最近一次自动下载失败的具体原因（直连与各镜像的错误），用于给用户可诊断的失败提示
+# 已知的 GitHub 加速镜像：既是 /pan pcs 可填的加速源白名单，也是「未配置代理时自动降级」的探测候选。
+# 加速源会被拼在请求 URL 前面，若允许任意地址，等于把「从哪下载二进制」交给填地址的人，
+# 因此限定 host 必须是下列域名（或其子域）；管理员自建镜像用环境变量追加。
+# 顺序按实测可用性排列（能代理 api.github.com 的排最前，直连 API 不通时靠它们取 release 信息）。
+_GITHUB_MIRROR_HOSTS = (
+    "gh-proxy.com", "gh-proxy.org", "ghfast.top", "ghproxy.net",
+    "ghproxy.com", "ghproxy.cc", "ghproxy.link",
+    "gh-proxy.net", "ghps.cc", "gh.llkk.cc",
+    "gitmirror.com", "hub.gitmirror.com",
+)
+_auto_mirror = ""  # 探测成功的加速镜像（仅进程内缓存，重启后重新探测）
+
+
+def _allowed_proxy_hosts() -> tuple:
+    """允许的加速源域名（内置镜像列表 + BAIDU_NETDISK_EXTRA_PROXIES 追加，英文逗号分隔）。"""
+    extra = os.environ.get("BAIDU_NETDISK_EXTRA_PROXIES", "")
+    hosts = tuple(h.strip().lower() for h in extra.split(",") if h.strip())
+    return _GITHUB_MIRROR_HOSTS + hosts
+
+
+def _validate_github_proxy(proxy: str) -> str | None:
+    """校验加速代理地址是否属于已知的 GitHub 加速源。合法返回 None，否则返回错误描述。"""
+    proxy = (proxy or "").strip()
+    if not proxy.lower().startswith(("http://", "https://")):
+        return "代理地址必须以 http:// 或 https:// 开头"
+    try:
+        parts = urllib.parse.urlsplit(proxy)
+    except ValueError:
+        return "代理地址格式不正确"
+    host = (parts.hostname or "").lower()
+    if parts.scheme not in ("http", "https") or not host:
+        return "代理地址格式不正确"
+    for allowed in _allowed_proxy_hosts():
+        if host == allowed or host.endswith("." + allowed):
+            return None
+    return ("代理只能填 GitHub 加速源，当前地址不在白名单内。可用: "
+            + "、".join(_allowed_proxy_hosts()))
+
+
+def _mirror_candidates() -> tuple:
+    """按优先级返回待探测的加速镜像地址（上次探测成功的排最前，避免每次下载都从头探测）。"""
+    hosts = list(_GITHUB_MIRROR_HOSTS)
+    if _auto_mirror:
+        cached = (urllib.parse.urlsplit(_auto_mirror).hostname or "").lower()
+        if cached in hosts:
+            hosts.remove(cached)
+            hosts.insert(0, cached)
+    return tuple(f"https://{h}" for h in hosts)
+
+
 # GitHub 加速代理（gh-proxy 类）：/pan pcs <代理地址> 保存后，下载与登录时自动下载都走该代理
 _GITHUB_PROXY_FILE = os.path.join(PLUGIN_DATA_DIR, "github_proxy.txt")
 _github_proxy = ""
@@ -154,7 +202,9 @@ try:
     _github_proxy = (open(_GITHUB_PROXY_FILE, "r", encoding="utf-8").read() or "").strip()
 except Exception:
     pass
-if _github_proxy and not _github_proxy.lower().startswith(("http://", "https://")):
+# 已保存的地址同样要过白名单：防止旧版本/手工改文件留下任意代理
+if _github_proxy and _validate_github_proxy(_github_proxy):
+    logger.warning(f"[baidu_netdisk] 已保存的加速代理不在白名单内，已忽略: {_github_proxy}")
     _github_proxy = ""
 
 
@@ -179,7 +229,7 @@ def _ensure_bpcs_exe() -> bool:
 
 
 def _auto_download_bpcs() -> bool:
-    """确保 BaiduPCS-Go 可用：缺失或损坏时自动下载（GitHub 官方 release 优先，国内镜像兜底）。
+    """确保 BaiduPCS-Go 可用：缺失或损坏时自动下载（GitHub 官方 release 优先，直连失败时自动挑选可用加速镜像）。
     并发安全（同一时间只允许一个下载任务）；下载失败会缓存标记，避免每次登录都长时间重试；
     失败原因记录到 _auto_dl_last_error 供用户侧提示。"""
     global _auto_dl_failed, _auto_dl_last_error
@@ -195,20 +245,13 @@ def _auto_download_bpcs() -> bool:
             return False
         logger.info("[baidu_netdisk] BaiduPCS-Go 不存在或不可用，开始自动下载...")
         result = _download_github_exe()
-        gh_err = result["error"] if "error" in result else ""
-        if "error" in result:
-            logger.warning(f"[baidu_netdisk] GitHub 自动下载失败，回退国内镜像: {result['error']}")
-            result = _download_cn_exe()
         if "error" in result:
             _auto_dl_failed = True
-            _auto_dl_last_error = "；".join(
-                part for part in (
-                    f"GitHub: {gh_err}" if gh_err else "",
-                    f"国内镜像: {result['error']}",
-                ) if part
-            )
+            _auto_dl_last_error = result["error"]
             logger.error(f"[baidu_netdisk] BaiduPCS-Go 自动下载失败: {_auto_dl_last_error}")
             return False
+        if result.get("via"):
+            logger.info(f"[baidu_netdisk] BaiduPCS-Go 已通过加速镜像 {result['via']} 下载完成")
         _auto_dl_failed = False
         _auto_dl_last_error = ""
         return _ensure_bpcs_exe()
@@ -223,11 +266,13 @@ def _proxied_url(proxy: str, url: str) -> str:
 
 def _set_github_proxy(proxy: str) -> str | None:
     """校验并持久化 GitHub 加速代理（供 /pan pcs <代理地址> 使用）。
+    只接受白名单内的加速源（详见 _validate_github_proxy）。
     成功返回 None，地址非法返回错误描述；写文件失败只记日志（本次会话仍生效）。"""
     global _github_proxy
     proxy = (proxy or "").strip().rstrip("/")
-    if not proxy.lower().startswith(("http://", "https://")):
-        return "代理地址必须以 http:// 或 https:// 开头"
+    err = _validate_github_proxy(proxy)
+    if err:
+        return err
     _github_proxy = proxy
     try:
         os.makedirs(PLUGIN_DATA_DIR, exist_ok=True)
@@ -238,20 +283,20 @@ def _set_github_proxy(proxy: str) -> str | None:
     return None
 
 
-def _fetch_release_info(proxy: str = "") -> dict | None:
+def _fetch_release_info(proxy: str = "", timeout: int = 30) -> dict | None:
     """从 GitHub API 获取官方 release 信息（下载 URL 和文件大小来自官方，不硬编码）。
     proxy 非空时通过加速代理访问 API（如 https://gh-proxy.org/https://api.github.com/...）。"""
     headers = {"User-Agent": "astrbot_plugin_baidu_netdisk", "Accept": "application/vnd.github+json"}
     api_url = _proxied_url(proxy, BPCS_API_URL)
     try:
-        resp = _req.get(api_url, timeout=30, headers=headers)
+        resp = _req.get(api_url, timeout=timeout, headers=headers)
         resp.raise_for_status()
         return resp.json()
     except _req.exceptions.SSLError:
         import urllib3 as _u3
         _u3.disable_warnings(_u3.exceptions.InsecureRequestWarning)
         try:
-            resp = _req.get(api_url, timeout=30, verify=False, headers=headers)
+            resp = _req.get(api_url, timeout=timeout, verify=False, headers=headers)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
@@ -262,67 +307,42 @@ def _fetch_release_info(proxy: str = "") -> dict | None:
         return None
 
 
-def _download_cn_exe() -> dict:
-    """仅尝试从国内镜像直链下载 BaiduPCS-Go（固定 v4.0.1，兜底用；**镜像仅提供 Windows 版**）。
-    返回 {"ok": True} 或 {"error": "..."}。"""
-    if not _IS_WINDOWS:
-        return {"error": "国内镜像仅提供 Windows 版 BaiduPCS-Go，当前平台请从 GitHub 官方 release 下载"}
-    def _get(url: str, timeout: int = 300) -> bytes | None:
-        headers = {"User-Agent": "astrbot_plugin_baidu_netdisk"}
-        try:
-            r = _req.get(url, timeout=timeout, headers=headers)
-            r.raise_for_status()
-            return r.content
-        except _req.exceptions.SSLError:
-            import urllib3 as _u3
-            _u3.disable_warnings(_u3.exceptions.InsecureRequestWarning)
-            try:
-                r = _req.get(url, timeout=timeout, verify=False, headers=headers)
-                r.raise_for_status()
-                return r.content
-            except Exception:
-                return None
-        except Exception:
-            return None
-
-    logger.info("[baidu_netdisk] 尝试从国内镜像下载 BaiduPCS-Go.exe...")
-    data = _get(BPCS_CN_URL, timeout=120)
-    if data is None:
-        return {"error": "国内镜像下载失败（网络不可达）"}
-    # 不做哈希校验，仅按平台校验二进制格式，避免把错误页/损坏文件写成本地 exe
-    err = _sanity_check_binary(data, "国内镜像下载的文件")
-    if err:
-        return {"error": err}
+def _probe_mirror(url: str, timeout: int = 10) -> bool:
+    """试探加速镜像能否代理该资产：只读响应前 4 字节，能连上且返回压缩包/可执行文件头才算可用。
+    连接失败与「镜像返回 HTML 错误页」都在这里挡掉，避免为不可用的镜像白下整包。"""
     try:
-        with open(BPCS_PATH, "wb") as f:
-            f.write(data)
-        logger.info(f"[baidu_netdisk] 国内镜像下载成功（{len(data)} bytes）")
-        return {"ok": True}
-    except Exception as e:
-        return {"error": f"写入 exe 失败: {e}"}
+        r = _req.get(url, timeout=timeout, stream=True,
+                     headers={"User-Agent": "astrbot_plugin_baidu_netdisk"})
+        try:
+            if r.status_code not in (200, 206):
+                return False
+            head = next(r.iter_content(4), b"")
+        finally:
+            r.close()
+    except Exception:
+        return False
+    return head[:2] in (b"PK", b"MZ")
 
 
-def _download_github_exe(proxy: str | None = None, max_attempts: int = 3) -> dict:
-    """从 GitHub 官方 release 下载当前平台对应的最新版 BaiduPCS-Go（`/releases/latest`，不固定版本）。
-    国内网络下 GitHub 下载经常瞬时失败（超时/连接重置/403），对可重试的失败自动重试，最多 max_attempts 次。
-    proxy 非空时把 API 与下载地址都加上加速代理前缀（如 https://gh-proxy.org/）；None/空串则直连。
-    返回 {"ok": True} 或 {"error": "..."}。"""
+def _download_asset(via: str, asset_url: str, tag: str, suffix: str,
+                    expected_size: int, max_attempts: int) -> str:
+    """下载 release 资产、解压出当前平台的可执行文件并写入本地（via 为空表示直连 GitHub）。
+    成功返回空串，失败返回错误描述。"""
     import zipfile as _zip, io as _io
 
-    if proxy is None:
-        proxy = _github_proxy
-
     def _get(url: str, timeout: int = 300) -> bytes | None:
         headers = {"User-Agent": "astrbot_plugin_baidu_netdisk"}
+        # 连接超时 10s、读取超时 300s：直连被墙时 10s 内就让位给加速镜像，慢速大文件仍有足够读取时间
+        timeouts = (10, timeout)
         try:
-            r = _req.get(url, timeout=timeout, headers=headers)
+            r = _req.get(url, timeout=timeouts, headers=headers)
             r.raise_for_status()
             return r.content
         except _req.exceptions.SSLError:
             import urllib3 as _u3
             _u3.disable_warnings(_u3.exceptions.InsecureRequestWarning)
             try:
-                r = _req.get(url, timeout=timeout, verify=False, headers=headers)
+                r = _req.get(url, timeout=timeouts, verify=False, headers=headers)
                 r.raise_for_status()
                 return r.content
             except Exception:
@@ -330,34 +350,16 @@ def _download_github_exe(proxy: str | None = None, max_attempts: int = 3) -> dic
         except Exception:
             return None
 
-    suffix = _bpcs_asset_suffix()
-    if not suffix:
-        return {"error": f"当前平台（{sys.platform}/{platform.machine()}）暂不支持自动下载 BaiduPCS-Go，请手动获取对应平台的二进制"}
-    info = _fetch_release_info(proxy)
-    if not info:
-        return {"error": "GitHub 官方 release 获取失败，请检查网络后重试"}
-    tag = info.get("tag_name", "latest")
-    # 资产名含版本号（如 BaiduPCS-Go-v4.0.2-linux-amd64.zip），按命名规则 + 平台后缀动态匹配，不硬编码
-    asset = None
-    for a in info.get("assets", []):
-        name = a.get("name", "")
-        if name.startswith("BaiduPCS-Go-") and name.endswith(f"-{suffix}.zip"):
-            asset = a
-            break
-    if not asset:
-        names = [a.get("name", "") for a in info.get("assets", [])]
-        return {"error": f"未在 release {tag} 中找到 {suffix} 的 zip 资产（现有: {names or '无'}）"}
-    download_url = _proxied_url(proxy, asset["browser_download_url"])
-    expected_size = asset["size"]
+    download_url = _proxied_url(via, asset_url)
     last_err = ""
     for attempt in range(1, max_attempts + 1):
         if attempt > 1:
             time.sleep(1.0 * (attempt - 1))  # 1s/2s 退避，给瞬时故障留恢复时间
-        via = f"通过加速代理 {proxy} " if proxy else ""
-        logger.info(f"[baidu_netdisk] {via}从 GitHub 官方 release 下载 BaiduPCS-Go {tag}（{suffix}，第 {attempt}/{max_attempts} 次尝试）...")
+        where = f"加速镜像 {via} " if via else "GitHub 官方 release "
+        logger.info(f"[baidu_netdisk] 从{where}下载 BaiduPCS-Go {tag}（{suffix}，第 {attempt}/{max_attempts} 次尝试）...")
         data = _get(download_url, timeout=300)
         if data is None:
-            last_err = "GitHub 下载失败（连接超时/被重置，请检查网络后重试）"
+            last_err = "下载失败（连接超时/被重置）"
             continue
         if len(data) != expected_size:
             last_err = f"下载大小不匹配: 官方API={expected_size}, 实际={len(data)}"
@@ -393,11 +395,79 @@ def _download_github_exe(proxy: str | None = None, max_attempts: int = 3) -> dic
                 f.write(exe_data)
             if not _IS_WINDOWS:
                 os.chmod(BPCS_PATH, 0o755)  # zip 不保留可执行位，POSIX 需手动加上
-            logger.info(f"[baidu_netdisk] GitHub 下载成功（{len(exe_data)} bytes, {tag}, {suffix}）")
-            return {"ok": True}
+            logger.info(f"[baidu_netdisk] BaiduPCS-Go 下载成功（{len(exe_data)} bytes, {tag}, {suffix}）")
+            return ""
         except Exception as e:
-            return {"error": f"写入 exe 失败: {e}"}  # 写盘失败重试无意义，直接返回
-    return {"error": last_err or "GitHub 下载失败，请检查网络后重试"}
+            return f"写入 exe 失败: {e}"  # 写盘失败重试无意义，直接返回
+    return last_err or "下载失败，请检查网络后重试"
+
+
+def _download_github_exe(proxy: str | None = None, max_attempts: int = 3,
+                         allow_mirrors: bool = True) -> dict:
+    """从 GitHub 官方 release 下载当前平台对应的最新版 BaiduPCS-Go（`/releases/latest`，不固定版本）。
+    国内网络下 GitHub 下载经常瞬时失败（超时/连接重置/403），对可重试的失败自动重试，最多 max_attempts 次。
+    指定 proxy（或存在已保存的代理）时只走该加速源；未配置代理时先直连 GitHub，直连失败后
+    依次探测候选加速镜像（见 _GITHUB_MIRROR_HOSTS）并改用可用的那个，各平台通用。
+    返回 {"ok": True, "via": 镜像} 或 {"error": "..."}；allow_mirrors=False 表示强制直连不走镜像。"""
+    global _auto_mirror
+
+    if proxy is None:
+        proxy = _github_proxy
+    if proxy:
+        proxy_err = _validate_github_proxy(proxy)
+        if proxy_err:
+            return {"error": proxy_err}
+    mirrors = _mirror_candidates() if (allow_mirrors and not proxy) else ()
+
+    suffix = _bpcs_asset_suffix()
+    if not suffix:
+        return {"error": f"当前平台（{sys.platform}/{platform.machine()}）暂不支持自动下载 BaiduPCS-Go，请手动获取对应平台的二进制"}
+
+    info = _fetch_release_info(proxy)
+    direct_api_ok = bool(info)
+    if not info and mirrors:
+        # 直连 API 不通时让能代理 api.github.com 的镜像提供 release 信息（资产仍优先直连）
+        for mirror in mirrors:
+            info = _fetch_release_info(mirror, timeout=10)
+            if info:
+                logger.info(f"[baidu_netdisk] GitHub API 直连不可用，改用加速镜像 {mirror} 获取 release 信息")
+                break
+    if not info:
+        return {"error": "GitHub 官方 release 获取失败，请检查网络后重试"}
+    tag = info.get("tag_name", "latest")
+    # 资产名含版本号（如 BaiduPCS-Go-v4.0.2-linux-amd64.zip），按命名规则 + 平台后缀动态匹配，不硬编码
+    asset = None
+    for a in info.get("assets", []):
+        name = a.get("name", "")
+        if name.startswith("BaiduPCS-Go-") and name.endswith(f"-{suffix}.zip"):
+            asset = a
+            break
+    if not asset:
+        names = [a.get("name", "") for a in info.get("assets", [])]
+        return {"error": f"未在 release {tag} 中找到 {suffix} 的 zip 资产（现有: {names or '无'}）"}
+
+    # API 都是靠镜像拿到的，说明直连基本不通，直连下载只试一次即可，省得白等重试
+    routes = [(proxy, max_attempts if direct_api_ok else 1, False)]
+    routes += [(m, 1, True) for m in mirrors]
+    errors = []
+    for via, attempts, need_probe in routes:
+        if need_probe:
+            # 先用几字节探针确认镜像真能代理该资产，再决定是否整包下载（不可用的直接跳过）
+            if not _probe_mirror(_proxied_url(via, asset["browser_download_url"])):
+                logger.info(f"[baidu_netdisk] 加速镜像 {via} 探测未通过，尝试下一个")
+                errors.append(f"{via}: 不可用")
+                continue
+            logger.info(f"[baidu_netdisk] 直连下载失败，改用加速镜像 {via}")
+        err = _download_asset(via, asset["browser_download_url"], tag, suffix, asset["size"], attempts)
+        if not err:
+            if need_probe:
+                _auto_mirror = via  # 记住可用镜像，本次运行后续下载优先复用
+            return {"ok": True, "via": via}
+        errors.append(f"{'直连' if not via else via}: {err}")
+    # 直连错误最有诊断价值，始终保留；镜像错误只留最后两条，避免报错糊成一团
+    if len(errors) > 3:
+        errors = errors[:1] + errors[-2:]
+    return {"error": "；".join(errors)}
 
 
 def _run_bpcs(args: list, timeout: int = 300) -> tuple:
@@ -2322,8 +2392,8 @@ class BaiduNetdiskPlugin(Star):
                 "/pan look  重新查看目录树",
                 "/pan down <文件或文件夹路径>  下载文件夹或文件（自动识别类型）",
                 "/pan login  登录/退出统一入口（发送 /pan login 查看登录菜单）",
-                "/pan pcs  下载/更新 BaiduPCS-Go 工具（GitHub→国内镜像兜底）",
-                "/pan pcs git  强制直连 GitHub 官方原始链接（不用代理、不回退镜像）",
+                "/pan pcs  下载/更新 BaiduPCS-Go 工具（直连失败时自动挑选可用加速镜像）",
+                "/pan pcs git  强制直连 GitHub 官方原始链接（不用代理、不用镜像）",
                 "/pan pcs <代理URL>  通过加速代理下载并保存（如 https://gh-proxy.org/）",
                 "/pan pcs off  清除已保存的加速代理",
             ]
@@ -2342,25 +2412,25 @@ class BaiduNetdiskPlugin(Star):
             if len(parts) > 1:
                 arg2 = parts[1]
                 if arg2 == "git":
-                    # 强制只走 GitHub 官方原始链接直连：不用代理、不回退国内镜像
+                    # 强制只走 GitHub 官方原始链接直连：不用代理、也不用加速镜像
                     yield event.plain_result("⏳ 正在从 GitHub 官方 release 直连下载最新版 BaiduPCS-Go...")
-                    result = await asyncio.to_thread(_download_github_exe, "")
+                    result = await asyncio.to_thread(_download_github_exe, "", 3, False)
                     if "ok" in result:
                         yield event.plain_result(f"✅ {_BPCS_EXE_NAME} 下载成功！现在可以使用 /pan login 等命令了。")
                     else:
                         yield event.plain_result(
                             f"❌ 下载失败: {result.get('error', '未知错误')}\n"
-                            "💡 网络不通时可改用 /pan pcs <加速代理地址> 通过代理下载，例如 /pan pcs https://gh-proxy.org/"
+                            "💡 网络不通时可改用 /pan pcs <加速镜像地址> 通过镜像下载，例如 /pan pcs https://gh-proxy.org/"
                         )
                     return
                 if arg2.lower() == "off":
-                    # 清除已保存的加速代理，回到默认下载方式
+                    # 清除已保存的加速代理，回到「自动挑选可用镜像」的默认下载方式
                     _github_proxy = ""
                     try:
                         os.remove(_GITHUB_PROXY_FILE)
                     except OSError:
                         pass
-                    yield event.plain_result("🗑️ 已清除 GitHub 加速代理，恢复默认下载方式（GitHub→国内镜像兜底）。")
+                    yield event.plain_result("🗑️ 已清除已保存的加速代理，回到自动挑选可用加速镜像的下载方式。")
                 elif arg2.lower().startswith(("http://", "https://")):
                     # 保存并走指定加速代理下载
                     set_err = _set_github_proxy(arg2)
@@ -2368,25 +2438,20 @@ class BaiduNetdiskPlugin(Star):
                         yield event.plain_result(f"❌ {set_err}")
                         return
                 else:
-                    yield event.plain_result("用法: /pan pcs [git|off|<加速代理地址>]")
-                    yield event.plain_result("  /pan pcs              下载/更新工具（GitHub→国内镜像兜底）")
-                    yield event.plain_result("  /pan pcs git          强制直连 GitHub 官方原始链接（不回退国内镜像）")
-                    yield event.plain_result("  /pan pcs <代理地址>   通过加速代理下载并保存（如 https://gh-proxy.org/，登录时自动下载也生效）")
-                    yield event.plain_result("  /pan pcs off          清除已保存的加速代理")
+                    yield event.plain_result("用法: /pan pcs [git|off|<加速镜像地址>]")
+                    yield event.plain_result("  /pan pcs              下载/更新工具（直连失败时自动挑选可用加速镜像）")
+                    yield event.plain_result("  /pan pcs git          强制直连 GitHub 官方原始链接（不用代理、不用镜像）")
+                    yield event.plain_result("  /pan pcs <镜像地址>   指定加速镜像下载并保存（如 https://gh-proxy.org/，登录时自动下载也生效）")
+                    yield event.plain_result("  /pan pcs off          清除已保存的加速代理，回到自动挑选镜像")
                     return
-            # 默认流程：GitHub 官方 latest release（有已保存代理则走代理），失败回退国内镜像
+            # 默认流程：GitHub 官方 latest release；已保存代理则只走它，否则直连失败后自动挑选可用镜像
             via = f"加速代理 {_github_proxy} " if _github_proxy else ""
-            yield event.plain_result(f"⏳ 正在{via}从 GitHub 官方 release 下载最新版 BaiduPCS-Go...")
+            yield event.plain_result(f"⏳ 正在{via}从 GitHub 官方 release 下载最新版 BaiduPCS-Go...（网络不通时会自动挑选可用加速镜像，可能稍慢）")
             result = await asyncio.to_thread(_download_github_exe)
             if "ok" in result:
+                used = f"（via 加速镜像 {result['via']}）" if result.get("via") else ""
                 saved = " 加速代理已保存，登录时自动下载也会使用。" if _github_proxy else ""
-                yield event.plain_result(f"✅ {_BPCS_EXE_NAME} 下载成功！现在可以使用 /pan login 等命令了。{saved}")
-                return
-            # GitHub 失败，回退国内镜像（固定 v4.0.1 兜底）
-            yield event.plain_result(f"⏳ GitHub 下载失败（{result.get('error', '未知原因')}），正在从国内镜像下载...")
-            result = await asyncio.to_thread(_download_cn_exe)
-            if "ok" in result:
-                yield event.plain_result(f"✅ {_BPCS_EXE_NAME} 下载成功！现在可以使用 /pan login 等命令了。")
+                yield event.plain_result(f"✅ {_BPCS_EXE_NAME} 下载成功{used}！现在可以使用 /pan login 等命令了。{saved}")
             else:
                 yield event.plain_result(f"❌ 下载失败: {result.get('error', '未知错误')}")
             return
@@ -2401,7 +2466,7 @@ class BaiduNetdiskPlugin(Star):
             if parts[0] != "login":
                 yield event.plain_result(f"❌ {_BPCS_EXE_NAME} 缺失或损坏，请使用 /pan help 中提供的命令进行下载或查看readme")
                 return
-            yield event.plain_result("⏳ BaiduPCS-Go 不存在或不可用，正在自动下载（GitHub 官方 release 优先，失败回退国内镜像）...")
+            yield event.plain_result("⏳ BaiduPCS-Go 不存在或不可用，正在自动下载（GitHub 官方 release 优先，直连失败时自动挑选可用加速镜像）...")
             if not await asyncio.to_thread(_auto_download_bpcs):
                 yield event.plain_result(
                     f"❌ BaiduPCS-Go 自动下载失败：{_auto_dl_last_error or '未知原因'}。"

@@ -22,7 +22,7 @@
 - **多平台适配**：napcat / SnowLuma（OneBot）、QQ 官方机器人、其他平台三种发送模式，大文件自动闪传
 - **自动清理**：下载完成后自动删除网盘转存文件；可配置定时清理本地下载文件
 - **一键登录**：主推扫码登录，无需密码、不怕泄露
-- **自动下载工具**：首次登录自动下载 BaiduPCS-Go，无需手动安装；网络差时自动回退国内镜像
+- **自动下载工具**：首次登录自动下载 BaiduPCS-Go，无需手动安装；GitHub 不通时自动挑选可用的加速镜像
 - **用户黑名单**：可配置黑名单，被拉黑用户的消息不回复（仅 OneBot 模式）
 
 > ⚠️ **重要限制（必读）**：**不支持下载自己的分享链接**——百度 API 限制同一账号不能把自己分享的文件转存回自己的网盘。分享者本人请从网盘原目录直接下载，或重新分享新链接。
@@ -40,10 +40,10 @@
 | `/pan login 3 <BDUSS> [STOKEN]` 或 `bduss ...` | 全部 | BDUSS 登录 |
 | `/pan login 4 <完整Cookie字符串>` 或 `cookies ...` | 全部 | Cookie 登录 |
 | `/pan login 0` 或 `out` | 全部 | 退出登录 |
-| `/pan pcs` | 全部 | 下载或重新下载 BaiduPCS-Go 工具（文件损坏时也可修复；GitHub→国内镜像兜底，有已保存代理则走代理） |
-| `/pan pcs git` | 全部 | 强制直连 GitHub 官方 release 下载（不用代理、不回退国内镜像） |
-| `/pan pcs <加速代理地址>` | 全部 | 通过加速代理下载并保存（如 `https://gh-proxy.org/`），后续登录时自动下载也生效 |
-| `/pan pcs off` | 全部 | 清除已保存的加速代理 |
+| `/pan pcs` | 全部 | 下载或重新下载 BaiduPCS-Go 工具（文件损坏时也可修复；直连 GitHub 失败时自动挑选可用加速镜像，已保存代理则只走代理） |
+| `/pan pcs git` | 全部 | 强制直连 GitHub 官方 release 下载（不用代理、也不用加速镜像） |
+| `/pan pcs <加速镜像地址>` | 全部 | 指定加速镜像下载并保存（如 `https://gh-proxy.org/`），后续登录时自动下载也生效 |
+| `/pan pcs off` | 全部 | 清除已保存的加速镜像，回到自动挑选镜像的下载方式 |
 | `/pan help` | 全部 | 查看帮助 |
 
 **使用示例**：
@@ -109,7 +109,7 @@
 
 ### BaiduPCS-Go
 
-插件**不内置** BaiduPCS-Go（Windows 下为 `BaiduPCS-Go.exe`，Linux/macOS 下为无扩展名的 `BaiduPCS-Go`）。**无需手动下载**：首次执行登录类命令（扫码、账密、BDUSS、Cookie，或配置 `bduuss` 启动自动登录）时会自动下载 GitHub 官方**最新 release** 中当前平台对应的二进制（Windows / Linux / macOS，x64 / arm64 自动匹配；GitHub 不可达时自动回退国内镜像，**国内镜像仅提供 Windows 版**）。也可手动用 `/pan pcs` 下载/更新，文件损坏用同一命令修复。GitHub 被墙/不可达时可指定**加速代理**下载：`/pan pcs https://gh-proxy.org/`（地址自动保存，之后登录时自动下载也走该代理；`/pan pcs off` 清除）；只走 GitHub 原始链接时用 `/pan pcs git`。
+插件**不内置** BaiduPCS-Go（Windows 下为 `BaiduPCS-Go.exe`，Linux/macOS 下为无扩展名的 `BaiduPCS-Go`）。**无需手动下载**：首次执行登录类命令（扫码、账密、BDUSS、Cookie，或配置 `bduuss` 启动自动登录）时会自动下载 GitHub 官方**最新 release** 中当前平台对应的二进制（Windows / Linux / macOS，x64 / arm64 自动匹配）。也可手动用 `/pan pcs` 下载/更新，文件损坏用同一命令修复。GitHub 直连不通时会**自动逐个探测常用的 GitHub 加速镜像**（`gh-proxy.com`、`ghfast.top` 等），用其中可用的那个完成下载，Windows / Linux / macOS 全平台都适用；探测成功的镜像在本次运行内会优先复用。也可手动指定镜像：`/pan pcs https://gh-proxy.org/`（地址自动保存，之后登录时自动下载也走它；`/pan pcs off` 清除后回到自动挑选）；只走 GitHub 原始链接时用 `/pan pcs git`。为防下载被指向任意服务器，可填的镜像**只限已知的加速源**；使用自建镜像的管理员可用环境变量 `BAIDU_NETDISK_EXTRA_PROXIES` 追加允许的域名（英文逗号分隔，添加后也会进入自动探测候选）。
 
 ### 安全声明
 
