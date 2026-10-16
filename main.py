@@ -277,6 +277,7 @@ _GITHUB_MIRROR_HOSTS = (
     "gitmirror.com", "hub.gitmirror.com",
 )
 _auto_mirror = ""  # 探测成功的加速镜像（仅进程内缓存，重启后重新探测）
+_last_release_error = ""  # 最近一次取 release 信息失败的原因：用于给用户更可操作的提示
 
 
 def _allowed_proxy_hosts() -> tuple:
@@ -284,6 +285,26 @@ def _allowed_proxy_hosts() -> tuple:
     extra = os.environ.get("BAIDU_NETDISK_EXTRA_PROXIES", "")
     hosts = tuple(h.strip().lower() for h in extra.split(",") if h.strip())
     return _GITHUB_MIRROR_HOSTS + hosts
+
+
+# GitHub 官方下载链路会经过的主机：release 资产会 302 到 objects.githubusercontent.com 等
+_GITHUB_DOWNLOAD_HOSTS = (
+    "github.com", "api.github.com", "objects.githubusercontent.com",
+    "codeload.github.com", "raw.githubusercontent.com", "githubusercontent.com",
+)
+
+
+def _download_host_allowed(host: str, extra: str = "") -> bool:
+    """下载/跳转目标主机是否可信：GitHub 官方域名、已知加速源，外加 extra（当前使用的镜像）本身。"""
+    host = (host or "").lower().rstrip(".")
+    if not host:
+        return False
+    allowed = list(_GITHUB_DOWNLOAD_HOSTS) + list(_allowed_proxy_hosts())
+    if extra:
+        eh = (urllib.parse.urlsplit(extra).hostname or "").lower().rstrip(".")
+        if eh:
+            allowed.append(eh)
+    return any(host == a or host.endswith("." + a) for a in allowed)
 
 
 def _validate_github_proxy(proxy: str) -> str | None:
@@ -298,6 +319,9 @@ def _validate_github_proxy(proxy: str) -> str | None:
     host = (parts.hostname or "").lower()
     if parts.scheme not in ("http", "https") or not host:
         return "代理地址格式不正确"
+    # 明文 http 下载链路可被中间人改写（含 302 到任意主机），只接受 https 加速源
+    if parts.scheme != "https":
+        return "代理地址必须以 https:// 开头：明文 http 加速源可被中间人篡改下载内容"
     for allowed in _allowed_proxy_hosts():
         if host == allowed or host.endswith("." + allowed):
             return None
@@ -324,9 +348,10 @@ try:
         _github_proxy = (f.read() or "").strip()
 except Exception:
     pass  # 首次运行或文件被删，等价于「没保存过代理」
-# 已保存的地址同样要过白名单：防止旧版本/手工改文件留下任意代理
-if _github_proxy and _validate_github_proxy(_github_proxy):
-    logger.warning(f"[baidu_netdisk] ⚠️ 已保存的加速代理不在白名单内，已忽略: {_github_proxy}")
+# 已保存的地址同样要过白名单：防止旧版本/手工改文件留下任意代理（含旧版曾允许的明文 http 地址）
+_saved_proxy_err = _validate_github_proxy(_github_proxy) if _github_proxy else None
+if _saved_proxy_err:
+    logger.warning(f"[baidu_netdisk] ⚠️ 已保存的加速代理不可用，已忽略: {_github_proxy}（{_saved_proxy_err}）")
     _github_proxy = ""
 
 
@@ -350,10 +375,11 @@ def _ensure_bpcs_exe() -> bool:
     return ok
 
 
-def _auto_download_bpcs() -> bool:
+def _auto_download_bpcs(allow_insecure_tls: bool = False) -> bool:
     """确保 BaiduPCS-Go 可用：缺失或损坏时自动下载（GitHub 官方 release 优先，直连失败时自动挑选可用加速镜像）。
     并发安全（同一时间只允许一个下载任务）；下载失败后进入冷却期，冷却期内跳过重试，
     冷却结束后自动再试（避免每次登录都长时间空等，同时保证普通用户能自愈）；
+    allow_insecure_tls 来自插件配置（是否允许证书校验失败时退回不校验模式）；
     失败原因记录到 _auto_dl_last_error 供用户侧提示。"""
     global _auto_dl_failed, _auto_dl_last_error, _auto_dl_failed_at
 
@@ -373,7 +399,7 @@ def _auto_download_bpcs() -> bool:
         if _in_cooldown():
             return False
         logger.info("[baidu_netdisk] BaiduPCS-Go 不存在或不可用，开始自动下载...")
-        result = _download_github_exe()
+        result = _download_github_exe(allow_insecure_tls=allow_insecure_tls)
         if "error" in result:
             _auto_dl_failed = True
             _auto_dl_failed_at = time.time()
@@ -394,6 +420,55 @@ def _proxied_url(proxy: str, url: str) -> str:
     return f"{proxy.rstrip('/')}/{url}"
 
 
+def _disable_urllib3_warnings() -> None:
+    """只在确实要发「不校验证书」请求前调用，免得日志被 InsecureRequestWarning 刷屏。"""
+    import urllib3 as _u3
+    _u3.disable_warnings(_u3.exceptions.InsecureRequestWarning)
+
+
+def _http_get(url: str, *, headers: dict, timeout: float | int | tuple, stream: bool = False,
+              extra_host: str = "",
+              allow_insecure_tls: bool = False) -> tuple[_req.Response | None, str]:
+    """带跳转校验的 GET：逐跳要求 https 且主机在白名单内（GitHub 官方域名 + 加速源 + extra_host），最多 3 跳。
+    返回 (响应, 错误描述)，正常时错误描述为空串、失败时响应为 None。
+
+    证书校验失败**不会**自动降级：只有调用方显式传入 allow_insecure_tls=True
+    （对应配置项 allow_insecure_tls）才退回不校验证书，且每次都记 warning 留痕。"""
+    hop_limit = 3
+    for _hop in range(hop_limit + 1):
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme != "https":
+            return None, f"拒绝非 https 下载地址：{parts.scheme or '未知'}://{parts.hostname or ''}"
+        if not _download_host_allowed(parts.hostname or "", extra_host):
+            # 攻击者控制的 302 想把我方下载引到别处，就在这里被拦住
+            return None, f"拒绝访问未授权的下载主机：{parts.hostname or url}"
+        try:
+            resp = _req.get(url, timeout=timeout, headers=headers, stream=stream, allow_redirects=False)
+        except _req.exceptions.SSLError as e:
+            if not allow_insecure_tls:
+                return None, (f"TLS 证书校验失败（{parts.hostname}）：如确认当前网络可信，"
+                              f"可在插件配置中开启「允许不校验证书」后重试（{e}）")
+            logger.warning(f"[baidu_netdisk] ⚠️ 已按配置关闭证书校验访问 {parts.hostname}，"
+                           f"本次下载内容可被中间人篡改")
+            _disable_urllib3_warnings()
+            try:
+                resp = _req.get(url, timeout=timeout, headers=headers, stream=stream,
+                                allow_redirects=False, verify=False)
+            except Exception as e2:
+                return None, f"请求失败：{e2}"
+        except Exception as e:
+            return None, f"请求失败：{e}"
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("Location", "")
+            resp.close()
+            if not location:
+                return None, "跳转响应缺少 Location"
+            url = urllib.parse.urljoin(url, location)
+            continue
+        return resp, ""
+    return None, f"跳转次数超过 {hop_limit} 次，已中止"
+
+
 def _set_github_proxy(proxy: str) -> str | None:
     """校验并持久化 GitHub 加速代理（供 /pan pcs <代理地址> 使用）。
     只接受白名单内的加速源（详见 _validate_github_proxy）。
@@ -411,44 +486,46 @@ def _set_github_proxy(proxy: str) -> str | None:
     return None
 
 
-def _fetch_release_info(proxy: str = "", timeout: int = 30) -> dict | None:
-    """从 GitHub API 获取官方 release 信息（下载 URL 和文件大小来自官方，不硬编码）。
+def _fetch_release_info(proxy: str = "", timeout: int = 30,
+                        allow_insecure_tls: bool = False) -> dict | None:
+    """从 GitHub API 获取官方 release 信息（下载 URL、文件大小与官方 sha256 都来自官方，不硬编码）。
     proxy 非空时通过加速代理访问 API（如 https://gh-proxy.org/https://api.github.com/...）。"""
+    global _last_release_error
     headers = {"User-Agent": "astrbot_plugin_baidu_netdisk", "Accept": "application/vnd.github+json"}
     api_url = _proxied_url(proxy, BPCS_API_URL)
+    resp, err = _http_get(api_url, headers=headers, timeout=timeout, extra_host=proxy,
+                          allow_insecure_tls=allow_insecure_tls)
+    if err:
+        _last_release_error = err
+        logger.error(f"[baidu_netdisk] ❌ 获取 GitHub release 信息失败: {err}")
+        return None
     try:
-        resp = _req.get(api_url, timeout=timeout, headers=headers)
         resp.raise_for_status()
+        _last_release_error = ""
         return resp.json()
-    except _req.exceptions.SSLError:
-        import urllib3 as _u3
-        _u3.disable_warnings(_u3.exceptions.InsecureRequestWarning)
-        try:
-            resp = _req.get(api_url, timeout=timeout, verify=False, headers=headers)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.error(f"[baidu_netdisk] ❌ 获取 GitHub release 信息失败: {e}")
-            return None
     except Exception as e:
+        _last_release_error = str(e)
         logger.error(f"[baidu_netdisk] ❌ 获取 GitHub release 信息失败: {e}")
         return None
 
 
-def _probe_mirror(url: str, timeout: int = 10) -> bool:
+def _probe_mirror(url: str, timeout: int = 10, extra_host: str = "",
+                  allow_insecure_tls: bool = False) -> bool:
     """试探加速镜像能否代理该资产：只读响应前 4 字节，能连上且返回压缩包/可执行文件头才算可用。
     连接失败与「镜像返回 HTML 错误页」都在这里挡掉，避免为不可用的镜像白下整包。"""
+    headers = {"User-Agent": "astrbot_plugin_baidu_netdisk"}
+    resp, err = _http_get(url, headers=headers, timeout=timeout, stream=True,
+                          extra_host=extra_host, allow_insecure_tls=allow_insecure_tls)
+    if err or resp is None:
+        return False
     try:
-        r = _req.get(url, timeout=timeout, stream=True,
-                     headers={"User-Agent": "astrbot_plugin_baidu_netdisk"})
-        try:
-            if r.status_code not in (200, 206):
-                return False
-            head = next(r.iter_content(4), b"")
-        finally:
-            r.close()
+        if resp.status_code not in (200, 206):
+            return False
+        head = next(resp.iter_content(4), b"")
     except Exception:
         return False
+    finally:
+        resp.close()
     return head[:2] in (b"PK", b"MZ")
 
 
@@ -469,7 +546,8 @@ def _extract_sha256(asset: dict) -> str:
 
 def _download_asset(via: str, asset_url: str, tag: str, suffix: str,
                     expected_size: int, max_attempts: int,
-                    expected_digest: str = "", require_digest: bool = False) -> str:
+                    expected_digest: str = "", require_digest: bool = False,
+                    allow_insecure_tls: bool = False) -> str:
     """下载 release 资产、解压出当前平台的可执行文件并写入本地（via 为空表示直连 GitHub）。
     成功返回空串，失败返回错误描述。
 
@@ -477,25 +555,19 @@ def _download_asset(via: str, asset_url: str, tag: str, suffix: str,
     require_digest=True 时缺少摘要直接拒绝——第三方来源拿不到官方完整性背书就不该采信。"""
     import zipfile as _zip, io as _io
 
-    def _get(url: str, timeout: int = 300) -> bytes | None:
+    def _get(url: str, timeout: int = 300) -> tuple[bytes | None, str]:
+        """返回 (内容, 错误描述)：失败时内容为 None，错误描述直接来自请求层或 HTTP 状态。"""
         headers = {"User-Agent": "astrbot_plugin_baidu_netdisk"}
         # 连接超时 10s、读取超时 300s：直连被墙时 10s 内就让位给加速镜像，慢速大文件仍有足够读取时间
-        timeouts = (10, timeout)
+        resp, err = _http_get(url, headers=headers, timeout=(10, timeout), extra_host=via,
+                              allow_insecure_tls=allow_insecure_tls)
+        if err or resp is None:
+            return None, err or "请求失败"
         try:
-            r = _req.get(url, timeout=timeouts, headers=headers)
-            r.raise_for_status()
-            return r.content
-        except _req.exceptions.SSLError:
-            import urllib3 as _u3
-            _u3.disable_warnings(_u3.exceptions.InsecureRequestWarning)
-            try:
-                r = _req.get(url, timeout=timeouts, verify=False, headers=headers)
-                r.raise_for_status()
-                return r.content
-            except Exception:
-                return None
-        except Exception:
-            return None
+            resp.raise_for_status()
+            return resp.content, ""
+        except Exception as e:
+            return None, f"HTTP {resp.status_code}: {e}"
 
     download_url = _proxied_url(via, asset_url)
     last_err = ""
@@ -504,9 +576,9 @@ def _download_asset(via: str, asset_url: str, tag: str, suffix: str,
             time.sleep(1.0 * (attempt - 1))  # 1s/2s 退避，给瞬时故障留恢复时间
         where = f"加速镜像 {via} " if via else "GitHub 官方 release "
         logger.info(f"[baidu_netdisk] 从{where}下载 BaiduPCS-Go {tag}（{suffix}，第 {attempt}/{max_attempts} 次尝试）...")
-        data = _get(download_url, timeout=300)
+        data, get_err = _get(download_url, timeout=300)
         if data is None:
-            last_err = "下载失败（连接超时/被重置）"
+            last_err = f"下载失败（{get_err}）"
             continue
         if len(data) != expected_size:
             last_err = f"下载大小不匹配: 官方API={expected_size}, 实际={len(data)}"
@@ -562,15 +634,16 @@ def _download_asset(via: str, asset_url: str, tag: str, suffix: str,
 
 
 def _download_github_exe(proxy: str | None = None, max_attempts: int = 3,
-                         allow_mirrors: bool = True) -> dict:
+                         allow_mirrors: bool = True, allow_insecure_tls: bool = False) -> dict:
     """从 GitHub 官方 release 下载当前平台对应的最新版 BaiduPCS-Go（`/releases/latest`，不固定版本）。
     国内网络下 GitHub 下载经常瞬时失败（超时/连接重置/403），对可重试的失败自动重试，最多 max_attempts 次。
-    指定 proxy（或存在已保存的代理）时只走该加速源；未配置代理时先直连 GitHub，直连失败后
+    指定 proxy（或存在已保存的代理）时资产只走该加速源；未配置代理时先直连 GitHub，直连失败后
     依次探测候选加速镜像（见 _GITHUB_MIRROR_HOSTS）并改用可用的那个，各平台通用。
     release 信息（含官方 sha256）始终优先直连 api.github.com，只有直连不通才退到代理/镜像；
     压缩包与官方 sha256 不一致时丢弃并换下一个来源，第三方来源缺少 sha256 时直接跳过。
     返回 {"ok": True, "via": 镜像, "digest_verified": bool, "info_trusted": bool, "info_source": str}
-    或 {"error": "..."}；allow_mirrors=False 表示强制直连不走镜像。"""
+    或 {"error": "..."}；allow_mirrors=False 表示强制直连不走镜像；
+    allow_insecure_tls=True（配置项）时证书校验失败才允许退回不校验模式。"""
     global _auto_mirror
 
     if proxy is None:
@@ -597,10 +670,11 @@ def _download_github_exe(proxy: str | None = None, max_attempts: int = 3,
         info_sources += [(m, False) for m in mirrors]
     for src, trustworthy in info_sources:
         if src:
-            info = _fetch_release_info(src, timeout=10)
+            info = _fetch_release_info(src, timeout=10, allow_insecure_tls=allow_insecure_tls)
         else:
             # 有后备来源时直连只等 15 秒：被墙时没必要让用户干等 30 秒
-            info = _fetch_release_info("", timeout=15 if len(info_sources) > 1 else 30)
+            info = _fetch_release_info("", timeout=15 if len(info_sources) > 1 else 30,
+                                       allow_insecure_tls=allow_insecure_tls)
         if info:
             info_trusted, info_source = trustworthy, src
             if trustworthy:
@@ -610,7 +684,11 @@ def _download_github_exe(proxy: str | None = None, max_attempts: int = 3,
                                f"{src} 提供；该来源可同时替换校验信息与压缩包，本次下载无法抵御它")
             break
     if not info:
-        return {"error": "GitHub 官方 release 获取失败，请检查网络后重试"}
+        # 证书链不完整时只报「检查网络」会让人无从下手：把可操作的那条线索带出来
+        hint = ""
+        if "证书校验失败" in _last_release_error:
+            hint = "（TLS 证书校验失败：如确认当前网络可信，可在插件配置中开启「允许不校验证书」后重试）"
+        return {"error": "GitHub 官方 release 获取失败，请检查网络后重试" + hint}
     tag = info.get("tag_name", "latest")
     # 资产名含版本号（如 BaiduPCS-Go-v4.0.2-linux-amd64.zip），按命名规则 + 平台后缀动态匹配，不硬编码
     asset = None
@@ -631,14 +709,16 @@ def _download_github_exe(proxy: str | None = None, max_attempts: int = 3,
     for via, attempts, need_probe in routes:
         if need_probe:
             # 先用几字节探针确认镜像真能代理该资产，再决定是否整包下载（不可用的直接跳过）
-            if not _probe_mirror(_proxied_url(via, asset["browser_download_url"])):
+            if not _probe_mirror(_proxied_url(via, asset["browser_download_url"]),
+                                 extra_host=via, allow_insecure_tls=allow_insecure_tls):
                 logger.info(f"[baidu_netdisk] 加速镜像 {via} 探测未通过，尝试下一个")
                 errors.append(f"{via}: 不可用")
                 continue
             logger.info(f"[baidu_netdisk] 直连下载失败，改用加速镜像 {via}")
         # 第三方来源必须能被官方摘要核对（require_digest），否则宁可不下载
         err = _download_asset(via, asset["browser_download_url"], tag, suffix, asset["size"], attempts,
-                              expected_digest=digest, require_digest=bool(via))
+                              expected_digest=digest, require_digest=bool(via),
+                              allow_insecure_tls=allow_insecure_tls)
         if not err:
             if need_probe:
                 _auto_mirror = via  # 记住可用镜像，本次运行后续下载优先复用
@@ -724,10 +804,10 @@ def _bpcs_config_path() -> str:
     return os.path.join(exe_dir, "pcs_config.json")  # HOME 缺失时落到程序目录
 
 
-def login_bduss_bpcs(bduss: str, stoken: str = "") -> dict:
+def login_bduss_bpcs(bduss: str, stoken: str = "", allow_insecure_tls: bool = False) -> dict:
     """用 BDUSS + STOKEN 登录 BaiduPCS-Go。"""
     global _bpcs_inited
-    if not _auto_download_bpcs():
+    if not _auto_download_bpcs(allow_insecure_tls):
         return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或联系管理员用 /pan pcs 手动下载）"}
     args = ["login", f"-bduss={bduss}"]
     if stoken:
@@ -767,10 +847,10 @@ def _patch_config_stoken(stoken: str, bduss: str = "") -> None:
         logger.warning(f"[baidu_netdisk] ⚠️ failed to patch config: {e}")
 
 
-def login_cookies_bpcs(cookie_str: str) -> dict:
+def login_cookies_bpcs(cookie_str: str, allow_insecure_tls: bool = False) -> dict:
     """用完整 Cookie 字符串登录 BaiduPCS-Go（v4.0.1 支持 -cookies 参数）。"""
     global _bpcs_inited
-    if not _auto_download_bpcs():
+    if not _auto_download_bpcs(allow_insecure_tls):
         return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或联系管理员用 /pan pcs 手动下载）"}
     # 清洗：去掉可能干扰的空名项（如 =value）和 *_BFESS 字段
     cleaned = "; ".join(
@@ -795,11 +875,11 @@ def login_cookies_bpcs(cookie_str: str) -> dict:
     return {"error": f"登录失败（退出码 {code}）: {text.strip()[:200]}"}
 
 
-def login_bpcs(username: str, password: str) -> dict:
+def login_bpcs(username: str, password: str, allow_insecure_tls: bool = False) -> dict:
     """用百度账号密码登录 BaiduPCS-Go，登录成功后凭证保存在本地，全局生效。
     优先走交互式 stdin 输入，避免密码出现在进程命令行（同机其他进程可见）。"""
     global _bpcs_inited
-    if not _auto_download_bpcs():
+    if not _auto_download_bpcs(allow_insecure_tls):
         return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或联系管理员用 /pan pcs 手动下载）"}
 
     # 方式一：交互式输入（密码不进命令行）
@@ -835,10 +915,10 @@ def login_bpcs(username: str, password: str) -> dict:
     return {"error": f"登录失败（退出码 {code}）: {text.strip()[:200]}"}
 
 
-def logout_bpcs() -> dict:
+def logout_bpcs(allow_insecure_tls: bool = False) -> dict:
     """退出 BaiduPCS-Go 当前登录的百度帐号，清除本地凭证。"""
     global _bpcs_inited
-    if not _auto_download_bpcs():
+    if not _auto_download_bpcs(allow_insecure_tls):
         return {"error": f"{_BPCS_EXE_NAME} 不可用且自动下载失败，请稍后重试（或联系管理员用 /pan pcs 手动下载）"}
     out, err, code = _run_bpcs(["logout", "-y"], timeout=30)
     text = (out or "") + chr(10) + (err or "")
@@ -1870,7 +1950,7 @@ class BaiduNetdiskPlugin(Star):
 
     def _auto_login_bduss(self, bduss: str) -> None:
         time.sleep(2)  # 等待 _init_bpcs 先跑完
-        result = login_bduss_bpcs(bduss, "")
+        result = login_bduss_bpcs(bduss, "", self._allow_insecure_tls())
         if "error" in result:
             logger.warning(f"[baidu_netdisk] ⚠️ bduuss 配置自动登录失败: {result['error']}")
         else:
@@ -2005,6 +2085,10 @@ class BaiduNetdiskPlugin(Star):
 
     def _get_send_mode(self) -> str:
         return str(self.config.get("send_mode", "onebot")).strip().lower()
+
+    def _allow_insecure_tls(self) -> bool:
+        """是否允许工具下载时在证书校验失败后退回不校验模式（默认关，见配置项 allow_insecure_tls）。"""
+        return _config_bool(self.config, "allow_insecure_tls", False)
 
     def _get_zip_max_mb(self) -> int:
         """文件夹打包 zip 的体积上限（MB），0 = 不限制。"""
@@ -2420,7 +2504,8 @@ class BaiduNetdiskPlugin(Star):
         if not event.is_private_chat():
             yield event.plain_result("⚠️ 密码会出现在聊天记录中，建议私聊执行以防泄露")
         yield event.plain_result("⏳ 正在登录百度网盘...")
-        result = await asyncio.to_thread(login_bpcs, username, password)
+        result = await asyncio.to_thread(login_bpcs, username, password,
+                                         self._allow_insecure_tls())
         if "error" in result:
             yield event.plain_result(f"❌ {result['error']}")
             return
@@ -2468,7 +2553,8 @@ class BaiduNetdiskPlugin(Star):
             bduss = parts[2]
             stoken = parts[3] if len(parts) >= 4 else ""
             yield event.plain_result("⏳ 正在登录...")
-            result = await asyncio.to_thread(login_bduss_bpcs, bduss, stoken)
+            result = await asyncio.to_thread(login_bduss_bpcs, bduss, stoken,
+                                             self._allow_insecure_tls())
             if "error" in result:
                 yield event.plain_result(f"❌ {result['error']}")
             else:
@@ -2486,7 +2572,8 @@ class BaiduNetdiskPlugin(Star):
             # Cookie 字符串本身不含空格分隔的多段，用剩余参数拼接，避免被空格截断
             cookie_str = " ".join(parts[2:])
             yield event.plain_result("⏳ 正在注入 Cookies...")
-            result = await asyncio.to_thread(login_cookies_bpcs, cookie_str)
+            result = await asyncio.to_thread(login_cookies_bpcs, cookie_str,
+                                             self._allow_insecure_tls())
             if "error" in result:
                 yield event.plain_result(f"❌ {result['error']}")
             else:
@@ -2495,7 +2582,7 @@ class BaiduNetdiskPlugin(Star):
 
         if method in ("0", "out", "logout", "off"):
             yield event.plain_result("⏳ 正在退出登录...")
-            result = await asyncio.to_thread(logout_bpcs)
+            result = await asyncio.to_thread(logout_bpcs, self._allow_insecure_tls())
             if "error" in result:
                 yield event.plain_result(f"❌ {result['error']}")
             else:
@@ -2614,13 +2701,15 @@ class BaiduNetdiskPlugin(Star):
                     yield event.plain_result("❌ 未能提取 BDUSS，登录失败")
                     return
                 # Step 4: 用完整 cookie 登录 BaiduPCS-Go
-                result = await asyncio.to_thread(login_cookies_bpcs, full_cookie)
+                result = await asyncio.to_thread(login_cookies_bpcs, full_cookie,
+                                                 self._allow_insecure_tls())
                 if "error" in result:
                     # 回退到仅 BDUSS+STOKEN 方式
                     stoken_m = re.search(r'STOKEN=([^\s;]+)', full_cookie)
                     bduss_val = bduss_m.group(1)
                     stoken_val = stoken_m.group(1) if stoken_m else ""
-                    result2 = await asyncio.to_thread(login_bduss_bpcs, bduss_val, stoken_val)
+                    result2 = await asyncio.to_thread(login_bduss_bpcs, bduss_val, stoken_val,
+                                                      self._allow_insecure_tls())
                     if "error" in result2:
                         yield event.plain_result(f"❌ {result2['error']}")
                     else:
@@ -2676,7 +2765,8 @@ class BaiduNetdiskPlugin(Star):
                 if arg2 == "git":
                     # 强制只走 GitHub 官方原始链接直连：不用代理、也不用加速镜像
                     yield event.plain_result("⏳ 正在从 GitHub 官方 release 直连下载最新版 BaiduPCS-Go...")
-                    result = await asyncio.to_thread(_download_github_exe, "", 3, False)
+                    result = await asyncio.to_thread(_download_github_exe, "", 3, False,
+                                                     self._allow_insecure_tls())
                     if "ok" in result:
                         yield event.plain_result(
                             f"✅ {_BPCS_EXE_NAME} 下载成功！现在可以使用 /pan login 等命令了。"
@@ -2712,7 +2802,8 @@ class BaiduNetdiskPlugin(Star):
             # 默认流程：GitHub 官方 latest release；已保存代理则只走它，否则直连失败后自动挑选可用镜像
             via = f"加速代理 {_github_proxy} " if _github_proxy else ""
             yield event.plain_result(f"⏳ 正在{via}从 GitHub 官方 release 下载最新版 BaiduPCS-Go...（网络不通时会自动挑选可用加速镜像，可能稍慢）")
-            result = await asyncio.to_thread(_download_github_exe)
+            result = await asyncio.to_thread(_download_github_exe, None, 3, True,
+                                             self._allow_insecure_tls())
             if "ok" in result:
                 used = f"（via 加速镜像 {result['via']}）" if result.get("via") else ""
                 saved = " 加速代理已保存，登录时自动下载也会使用。" if _github_proxy else ""
@@ -2738,7 +2829,7 @@ class BaiduNetdiskPlugin(Star):
                 )
                 return
             yield event.plain_result("⏳ BaiduPCS-Go 不存在或不可用，正在自动下载（GitHub 官方 release 优先，直连失败时自动挑选可用加速镜像）...")
-            if not await asyncio.to_thread(_auto_download_bpcs):
+            if not await asyncio.to_thread(_auto_download_bpcs, self._allow_insecure_tls()):
                 yield event.plain_result(
                     f"❌ BaiduPCS-Go 自动下载失败：{_auto_dl_last_error or '未知原因'}。"
                     f"请稍后重试{'（或用 /pan pcs 手动下载）' if event.is_admin() else '，或联系管理员处理'}"
