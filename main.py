@@ -836,7 +836,10 @@ def _resolve_share_via_page(sess, surl: str, share_link: str) -> dict:
                 if isinstance(e, _req.exceptions.ReadTimeout):
                     # 正常分享页 1s 左右响应；两次都读超时基本是分享已在服务端失效
                     return {"error": "分享页无响应（重试仍超时），该分享链接很可能已失效，请让分享者重新分享"}
-                raise
+                # 其余网络异常（连接失败/SSL 等）不能往上抛：会一路冒到命令层，
+                # 用户只看到框架的通用报错，这里转成可读提示
+                logger.warning(f"[baidu_netdisk] ⚠️ 分享页解析兜底失败: {e}")
+                return {"error": f"访问百度网盘失败（{type(e).__name__}），请检查服务器网络后重试"}
             logger.warning(f"[baidu_netdisk] 分享页请求失败，重试: {e}")
             time.sleep(1)
     if _grab_share_field(r.text, "loginstate") == "0":
@@ -894,10 +897,14 @@ def _share_api_preflight(sess, surl: str, pwd: str, share_link: str) -> dict:
             "Referer": share_link,
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         }
-        r2 = sess.post(verify_url, data={
-            "pwd": pwd, "vcode": "null", "vcode_str": "null", "bdstoken": bdstoken
-        }, headers=headers, timeout=20)
-        resp2 = r2.json()
+        try:
+            r2 = sess.post(verify_url, data={
+                "pwd": pwd, "vcode": "null", "vcode_str": "null", "bdstoken": bdstoken
+            }, headers=headers, timeout=20)
+            resp2 = r2.json()
+        except (_req.exceptions.RequestException, ValueError) as e:
+            logger.warning(f"[baidu_netdisk] ⚠️ 提取码验证请求失败: {e}")
+            return {"error": f"提取码验证请求失败（{type(e).__name__}），请检查网络后重试"}
         if resp2.get("errno") != 0:
             if resp2.get("errno") == -9:
                 return {"error": "提取码错误"}
@@ -1229,6 +1236,10 @@ def _parse_ls_line(line: str):
     return name, size_raw, is_dir
 
 
+_TREE_DISPLAY_LIMIT_PER_DIR = 60  # 目录树文本中每个目录最多显示多少项（避免消息过长）
+_TREE_MAX_ITEMS = 300  # 目录树最多记录多少项；/pan down <路径> 靠这份清单解析路径
+
+
 def _list_share_tree_api(surl: str, pwd: str) -> dict:
     """通过 share/list API 直接列出分享目录树（不转存、不依赖 /s/ 分享页）。
     只读目录结构，不占网盘空间，特大分享（TB 级）也能正常浏览。
@@ -1237,7 +1248,12 @@ def _list_share_tree_api(surl: str, pwd: str) -> dict:
     if sess is None:
         return {"error": "无法获取百度网盘登录凭证，请先使用 /pan login 1 登录"}
     share_link = f"https://pan.baidu.com/s/{surl}"
-    pf = _share_api_preflight(sess, surl, pwd, share_link)
+    try:
+        pf = _share_api_preflight(sess, surl, pwd, share_link)
+    except Exception as e:
+        # 前置接口的意外异常不能冒到命令层：否则 /pan <链接> 只抛框架通用错误，用户看不到原因
+        logger.error(f"[baidu_netdisk] ❌ 分享前置检查异常: {e}")
+        return {"error": f"访问百度网盘失败（{type(e).__name__}），请稍后重试"}
     if "error" in pf:
         return pf
     bdstoken, short = pf["bdstoken"], pf["short"]
@@ -1246,7 +1262,7 @@ def _list_share_tree_api(surl: str, pwd: str) -> dict:
     state = {"truncated": False}
 
     def _walk(dir_rel: str, api_dir: str, depth: int):
-        if len(items) > 300:
+        if len(items) >= _TREE_MAX_ITEMS:
             state["truncated"] = True
             return
         if depth > 2:  # 最多展示 3 层，更深的用 /pan down <路径> 按需下载
@@ -1273,27 +1289,40 @@ def _list_share_tree_api(surl: str, pwd: str) -> dict:
             logger.warning(f"[baidu_netdisk] share/list {dir_rel or '根目录'} 失败: {e}")
             return
         prefix = "  " * depth
-        for f in lst[:60]:
+        shown = 0
+        omitted = 0
+        for f in lst:
             name = f.get("server_filename") or ""
             if not name:
                 continue
+            if len(items) >= _TREE_MAX_ITEMS:
+                state["truncated"] = True
+                break
             is_dir = str(f.get("isdir")) == "1"
             rel = f"{dir_rel}/{name}" if dir_rel else name
+            # 无论是否显示都记入 items：/pan down <路径> 靠这份清单解析路径，
+            # 只记显示出来的会让第 61 项之后的文件既看不到也下不了
+            items.append({"path": rel, "name": name,
+                          "size": "-" if is_dir else str(f.get("size", 0)),
+                          "is_dir": is_dir, "fs_id": str(f.get("fs_id"))})
+            if shown >= _TREE_DISPLAY_LIMIT_PER_DIR:
+                # 超出显示上限：不再显示、也不再递归展开（该项仍可用 /pan down 按路径下载）
+                omitted += 1
+                continue
+            shown += 1
             if is_dir:
                 lines.append(f"{prefix}📁 {name}/")
-                items.append({"path": rel, "name": name, "size": "-", "is_dir": True,
-                              "fs_id": str(f.get("fs_id"))})
                 _walk(rel, f.get("path") or "", depth + 1)
             else:
                 lines.append(f"{prefix}📄 {name}  ({_format_size(str(f.get('size', 0)))})")
-                items.append({"path": rel, "name": name, "size": str(f.get("size", 0)),
-                              "is_dir": False, "fs_id": str(f.get("fs_id"))})
+        if omitted:
+            lines.append(f"{prefix}… 本目录另有 {omitted} 项未显示（可用 /pan down 加完整路径下载）")
 
     _walk("", "", 0)
     if not lines:
         return {"error": "目录为空或获取失败"}
     if state["truncated"]:
-        lines.append("（目录过多已截断，建议用 /pan down <路径> 直接下载需要的文件）")
+        lines.append(f"（目录过多，仅列出前 {_TREE_MAX_ITEMS} 项；其余内容可用 /pan down 加完整路径下载）")
     return {"text": "\n".join(lines), "items": items}
 
 
@@ -1966,11 +1995,12 @@ class BaiduNetdiskPlugin(Star):
         return False
 
     async def _send_folder(self, event: AstrMessageEvent, dl: dict, share_url: str = "",
-                           label: str = "") -> str:
+                           label: str = "", notify: bool = True) -> str:
         """文件夹下载完成后的发送策略（QQ 等平台不能直接发送文件夹）：
         文件数 ≤ 阈值（默认 3，可配置）时逐个发送；否则打包 zip 当单文件发送；
         打包失败或体积超限时降级为「本地路径 + 文件清单」。
-        返回给用户的收尾文本。"""
+        notify=False 时降级文本不在内部发送，由调用方负责发给用户（命令路径下
+        调用方会 yield 返回值，内部再发一次就是重复发送）。"""
         files = dl.get("files") or []
         count = len(files)
         folder_name = dl.get("name") or "未命名"
@@ -1998,11 +2028,11 @@ class BaiduNetdiskPlugin(Star):
         size_text = _format_size(str(total_bytes))
         if is_official and total_bytes > FLASH_TASK_LIMIT_MB * 1024 * 1024:
             return await self._folder_fallback(
-                event, dl, f"⚠️ 文件夹约 {size_text}，超过 QQ 官方 {FLASH_TASK_LIMIT_MB}MB 限制，未打包发送", subject)
+                event, dl, f"⚠️ 文件夹约 {size_text}，超过 QQ 官方 {FLASH_TASK_LIMIT_MB}MB 限制，未打包发送", subject, notify)
         zip_max_mb = self._get_zip_max_mb()
         if zip_max_mb > 0 and total_bytes > zip_max_mb * 1024 * 1024:
             return await self._folder_fallback(
-                event, dl, f"⚠️ 文件夹约 {size_text}，超过打包上限 {zip_max_mb}MB（配置 zip_max_size），未打包发送", subject)
+                event, dl, f"⚠️ 文件夹约 {size_text}，超过打包上限 {zip_max_mb}MB（配置 zip_max_size），未打包发送", subject, notify)
         # 打包需临时占用等量磁盘（zip 与原始文件并存），空间不足直接降级，避免压到一半失败
         try:
             free = shutil.disk_usage(PLUGIN_DATA_DIR).free
@@ -2010,7 +2040,7 @@ class BaiduNetdiskPlugin(Star):
                 return await self._folder_fallback(
                     event, dl,
                     f"⚠️ 打包需约 {_format_size(str(total_bytes))} 临时空间，当前可用 {_format_size(str(free))}，空间不足未打包",
-                    subject)
+                    subject, notify)
         except Exception as e:
             logger.warning(f"[baidu_netdisk] _send_folder: 磁盘空间检查失败: {e}")
 
@@ -2019,7 +2049,7 @@ class BaiduNetdiskPlugin(Star):
         zip_path = os.path.join(PLUGIN_DATA_DIR, "zips", f"{safe_name}_{uuid.uuid4().hex[:8]}.zip")
         z = await asyncio.to_thread(_zip_files, files, zip_path, folder_name)
         if "error" in z:
-            return await self._folder_fallback(event, dl, f"⚠️ 打包失败（{z['error']}），未发送", subject)
+            return await self._folder_fallback(event, dl, f"⚠️ 打包失败（{z['error']}），未发送", subject, notify)
         logger.info(f"[baidu_netdisk] _send_folder: 打包完成 name={zip_name}, size={z['size']}, "
                     f"stored={z.get('stored')}, deflated={z.get('deflated')}")
         # 磁盘上用带随机后缀的唯一名（避免同名文件夹并发打包互相覆盖），发给用户时用干净名
@@ -2034,11 +2064,14 @@ class BaiduNetdiskPlugin(Star):
                 pass
         if sent_ok:
             return f"✅ {subject} 下载完成，已打包为 {zip_name} 发送（共 {count} 个文件）"
-        return await self._folder_fallback(event, dl, "⚠️ zip 发送失败，未发送", subject)
+        return await self._folder_fallback(event, dl, "⚠️ zip 发送失败，未发送", subject, notify)
 
     async def _folder_fallback(self, event: AstrMessageEvent, dl: dict, extra: str = "",
-                               label: str = "") -> str:
-        """文件夹无法直接发送时的降级输出：报完成 + 本地路径 + 文件清单。"""
+                               label: str = "", notify: bool = True) -> str:
+        """文件夹无法直接发送时的降级输出：报完成 + 本地路径 + 文件清单。
+
+        notify=False 只返回文本、不发送：命令路径的调用方会 yield 这段文本，
+        内部再发一次就会让用户收到两遍。"""
         files = dl.get("files") or []
         subject = label or f"文件夹 '{dl.get('name') or '未命名'}'"
         lines = [f"✅ {subject} 下载完成，共 {len(files)} 个文件"]
@@ -2051,7 +2084,8 @@ class BaiduNetdiskPlugin(Star):
         if len(files) > 20:
             lines.append(f"… 另有 {len(files) - 20} 个文件未显示")
         text = "\n".join(lines)
-        await event.send(event.plain_result(text))
+        if notify:
+            await event.send(event.plain_result(text))
         return text
 
     @filter.llm_tool(name="pan_list")
@@ -2713,12 +2747,17 @@ class BaiduNetdiskPlugin(Star):
                         logger.error(f"[baidu_netdisk] on_pan down: download error: {dl['error']}")
                         yield event.plain_result(f"❌ {dl['error']}")
                     else:
+                        share_url = f"https://pan.baidu.com/s/{self._cache_get(uid)['surl']}"
                         if dl.get("is_dir"):
-                            # 文件夹不能直接发送：≤阈值逐个发，否则打包 zip，超限则降级为路径+清单
-                            share_url = f"https://pan.baidu.com/s/{self._cache_get(uid)['surl']}"
-                            yield event.plain_result(await self._send_folder(event, dl, share_url))
+                            # 文件夹不能直接发送：≤阈值逐个发，否则打包 zip，超限则降级为路径+清单。
+                            # notify=False：这里会把返回文本 yield 给用户，内部再发一次就是重复发送
+                            yield event.plain_result(
+                                await self._send_folder(event, dl, share_url, notify=False))
                         else:
-                            yield event.chain_result([File(name=dl.get("name", "file"), file=dl["path"])])
+                            # 走统一发送策略：平台适配（onebot/official/other）、大小限制、
+                            # 发送失败回退分享链接都由 _send_file 处理
+                            if not await self._send_file(event, dl, share_url):
+                                yield event.plain_result(f"📁 发送未成功，文件已保存到本地: {dl['path']}")
             finally:
                 if _lock_acquired:
                     self._active_downloads.pop(dl_key, None)
