@@ -135,6 +135,11 @@ def _config_bool(config: AstrBotConfig, key: str, default: bool) -> bool:
 # ---- 并发控制 ----
 
 _MAX_CONCURRENT_DOWNLOADS = 2  # 同时进行的下载任务上限（每个任务一个 BaiduPCS-Go 进程，抢同一份带宽与磁盘）
+# 云端大小未知时，多久之内被写过的同名本地文件算「疑似残留」：正常下载写入是连续的，
+# 上一次被强杀留下的半截文件 mtime 就在刚刚，这个窗口足以把它们排除掉
+_PARTIAL_GRACE_SECONDS = 300
+# 「命令被中断」后等待 worker 出结果的轮询间隔（秒）
+_INTERRUPT_POLL_SECONDS = 2
 _USER_LOCK_MAX_ENTRIES = 200  # 用户级串行锁最多保留多少条，超出时清理空闲条目
 _download_semaphore: asyncio.Semaphore | None = None
 _active_download_slots = 0  # 已占用的下载通道数（仅在事件循环内读写，用于排队时告知用户）
@@ -171,6 +176,14 @@ class _DownloadGuard:
     def __init__(self, release: Callable[[], None]) -> None:
         self._release = release
         self._handed_to_worker = False
+        self._outcome: tuple[bool, object] | None = None
+
+    def outcome(self) -> tuple[bool, object] | None:
+        """worker 的最终结果 `(是否成功, 结果或异常)`；还没跑完时为 None。
+
+        结果不能只留在 Future 上：调用方被取消时 `Task.cancel()` 会连带取消它正在 await 的
+        future，结果就再没人拿得到（命令被框架中断正是这种情况，下载线程却还在写盘）。"""
+        return self._outcome
 
     def start(self, fn: Callable, /, *args: object, **kwargs: object) -> asyncio.Future:
         """在独立线程里执行阻塞下载，返回可 await 的 Future（结果/异常原样送回）。
@@ -203,11 +216,13 @@ class _DownloadGuard:
             try:
                 result = fn(*args, **kwargs)
             except BaseException as exc:  # 线程里任何异常都要送回事件循环，避免线程静默失败
+                self._outcome = (False, exc)
                 try:
                     loop.call_soon_threadsafe(_deliver, future.set_exception, exc)
                 except RuntimeError:
                     logger.error(f"[baidu_netdisk] ❌ 下载线程回传异常失败（事件循环已关闭）: {exc}")
             else:
+                self._outcome = (True, result)
                 try:
                     loop.call_soon_threadsafe(_deliver, future.set_result, result)
                 except RuntimeError:
@@ -310,6 +325,12 @@ _MANIFEST_PATH = os.path.join(PLUGIN_DATA_DIR, "cleanup_manifest.json")
 # 清单的读-改-写锁：下载完成登记与定时清理都跑在工作线程里，必须用线程锁
 _MANIFEST_LOCK = threading.Lock()
 
+# 发送失败（机器人掉线、会话过期等）的最终结果文本：落盘保留，等用户下次交互时补发
+_NOTICE_PATH = os.path.join(PLUGIN_DATA_DIR, "pending_notices.json")
+_NOTICE_LOCK = threading.Lock()
+_NOTICE_MAX_PER_USER = 3      # 每人最多留几条，避免机器人长期离线时无限堆积
+_NOTICE_MAX_CHARS = 300       # 单条最长字符数
+
 _bpcs_inited = False
 _bpcs_lock = threading.Lock()
 _auto_delete_cloud = True
@@ -354,16 +375,30 @@ _GITHUB_DOWNLOAD_HOSTS = (
     "codeload.github.com", "raw.githubusercontent.com", "githubusercontent.com",
 )
 
+# 合法主机名只由字母数字、点、连字符组成（这里不接受 IPv6 字面量与下划线，
+# 白名单里的下载源都是普通域名，无需为它们放宽字符集）
+_HOST_RE = re.compile(r"^[a-z0-9.-]+$")
+
+
+def _host_is_sane(host: str) -> bool:
+    """主机名是否可安全用于「后缀白名单」比较。
+
+    urlsplit 按 RFC 3986 解析，而 requests/urllib3 把 `\\` 当路径分隔符：
+    `https://evil.com\\.gh-proxy.com/x` 在 urlsplit 里的主机名以 `.gh-proxy.com` 结尾，
+    能通过后缀白名单，实际连接的却是 evil.com。含反斜杠等异常字符的主机名一律不受信。"""
+    return bool(_HOST_RE.match(host or ""))
+
 
 def _download_host_allowed(host: str, extra: str = "") -> bool:
     """下载/跳转目标主机是否可信：GitHub 官方域名、已知加速源，外加 extra（当前使用的镜像）本身。"""
     host = (host or "").lower().rstrip(".")
-    if not host:
+    if not _host_is_sane(host):
         return False
-    allowed = list(_GITHUB_DOWNLOAD_HOSTS) + list(_allowed_proxy_hosts())
+    allowed = [a for a in list(_GITHUB_DOWNLOAD_HOSTS) + list(_allowed_proxy_hosts())
+               if _host_is_sane(a)]
     if extra:
         eh = (urllib.parse.urlsplit(extra).hostname or "").lower().rstrip(".")
-        if eh:
+        if _host_is_sane(eh):
             allowed.append(eh)
     return any(host == a or host.endswith("." + a) for a in allowed)
 
@@ -378,7 +413,7 @@ def _validate_github_proxy(proxy: str) -> str | None:
     except ValueError:
         return "代理地址格式不正确"
     host = (parts.hostname or "").lower()
-    if parts.scheme not in ("http", "https") or not host:
+    if parts.scheme not in ("http", "https") or not _host_is_sane(host):
         return "代理地址格式不正确"
     # 明文 http 下载链路可被中间人改写（含 302 到任意主机），只接受 https 加速源
     if parts.scheme != "https":
@@ -1314,6 +1349,50 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str, fs_ids: list = None
         return {"error": f"转存API调用异常: {e}"}
 
 
+def _notice_queue(uid: str, text: str) -> None:
+    """记录一条发送失败的最终结果，等该用户下次交互时补发。
+
+    机器人掉线 / 会话过期时，一次发送失败就意味着用户既拿不到文件也拿不到原因；
+    重试之外再落盘一份，用户下次说话时还能看到。"""
+    if not uid or not text:
+        return
+    with _NOTICE_LOCK:
+        notices = _notices_load()
+        items = notices.setdefault(uid, [])
+        items.append(text[:_NOTICE_MAX_CHARS])
+        del items[:-_NOTICE_MAX_PER_USER]
+        _notices_save(notices)
+
+
+def _notice_take(uid: str) -> list[str]:
+    """取出并清除该用户的待补发结果。"""
+    with _NOTICE_LOCK:
+        notices = _notices_load()
+        items = notices.pop(uid, [])
+        if items:
+            _notices_save(notices)
+    return items
+
+
+def _notices_load() -> dict:
+    try:
+        with open(_NOTICE_PATH, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): [str(t) for t in v] for k, v in data.items()
+            if isinstance(v, list) and v}
+
+
+def _notices_save(notices: dict) -> None:
+    try:
+        _atomic_write_json(_NOTICE_PATH, notices)
+    except OSError as e:
+        logger.warning(f"[baidu_netdisk] ⚠️ 保存待补发结果失败: {e}")
+
+
 def _manifest_load() -> set:
     """读取本插件下载过的文件清单。"""
     try:
@@ -1332,8 +1411,14 @@ def _manifest_save(paths: set) -> None:
 
 
 def _manifest_add(paths: list) -> None:
-    """登记插件下载到本地的文件，供定时清理使用。"""
+    """登记插件下载到本地的文件，供定时清理使用。
+
+    只登记下载目录内的路径：清理会真删文件，越界路径（`..` 拼接、他人目录）一律拒绝。"""
     new = {p for p in paths if p}
+    refused = {p for p in new if not _is_inside_download_dir(p)}
+    if refused:
+        logger.warning(f"[baidu_netdisk] ⚠️ 拒绝登记下载目录之外的路径: {sorted(refused)}")
+        new -= refused
     if not new:
         return
     # 读-改-写必须整体串行：两个并发下载各自「读到旧清单再写回」会丢掉对方刚登记的文件，
@@ -1352,6 +1437,10 @@ def _cleanup_local_dir() -> None:
         removed = 0
         remain = set()
         for p in paths:
+            if not _is_inside_download_dir(p):
+                # 早期版本或异常拼接可能留下越界条目：绝不删除，并从清单里剔除
+                logger.warning(f"[baidu_netdisk] ⚠️ 清理清单含下载目录之外的路径，已忽略: {p}")
+                continue
             try:
                 if os.path.isfile(p):
                     os.remove(p)
@@ -1649,6 +1738,9 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
     bucket: 本次任务在网盘目录中的隔离子目录名，用于把下载结果精确归属到本次任务。
     progress_queue: 可选，传入 queue.Queue 后，下载过程中会向队列放入进度信息。
     """
+    path_error = _validate_remote_path(cloud_path)
+    if path_error:
+        return {"error": path_error}
     cloud_dir = cloud_dir or CLOUD_SAVE_DIR or DEFAULT_CLOUD_SAVE_DIR
     if cloud_path:
         full_path = f"{cloud_dir}/{cloud_path.strip('/')}"
@@ -1700,12 +1792,19 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
                 continue
             try:
                 local_size = os.path.getsize(p)
+                local_mtime = os.path.getmtime(p)
             except OSError:
                 continue  # 恰好在检查期间被清理掉：当作本地没有，继续走下载
             # 只认「大小与云端一致」的本地文件：上次下载超时被强杀会留下半截文件，
             # 无脑复用等于把截断的文件当成下载成功发出去（它也不会出现在清理清单里）
-            if not _size_matches(local_size, file_size):
-                logger.warning(f"[baidu_netdisk] ⚠️ 本地同名文件大小与云端不一致（疑似残留半截文件），忽略: {p}")
+            if file_size > 0:
+                if not _size_matches(local_size, file_size):
+                    logger.warning(f"[baidu_netdisk] ⚠️ 本地同名文件大小与云端不一致（疑似残留半截文件），忽略: {p}")
+                    continue
+            elif local_size == 0 or time.time() - local_mtime < _PARTIAL_GRACE_SECONDS:
+                # 云端大小未知时没有参照可比，只能排除「刚被写过」的：那种多半是上一次
+                # 被强杀的下载留下的半截文件（清理清单里也可能还没有它）。宁可让 BPCS 重下
+                logger.warning(f"[baidu_netdisk] ⚠️ 云端大小未知且本地同名文件刚被写过（疑似残留），忽略: {p}")
                 continue
             logger.info(f"[baidu_netdisk] file already exists locally: {p}")
             return {"path": p, "name": file_name, "size": local_size, "is_dir": False}
@@ -1969,18 +2068,46 @@ def _get_local_file_size(file_name: str) -> int:
     return 0
 
 
+def _validate_remote_path(path: str) -> str:
+    """用户/远程给出的网盘路径能否安全用于本地路径拼接；返回错误描述，合法返回空串。
+
+    网盘路径本身是规范化的，正常不会出现上一级引用（`..`）；而 Windows 上 `\\` 是路径
+    分隔符，远程文件名里的 `\\` 会让本地镜像路径跑到下载目录之外——登记进清理清单就等于
+    让定时任务真去删那个路径。"""
+    if not path:
+        return ""
+    parts = [p for p in path.replace("\\", "/").split("/") if p and p != "."]
+    if any(p == ".." for p in parts):
+        return "路径包含上一级目录引用（..），已拒绝"
+    if _IS_WINDOWS and "\\" in path:
+        return "路径包含反斜杠，Windows 上无法安全下载该文件"
+    return ""
+
+
+def _is_inside_download_dir(path: str) -> bool:
+    """路径是否落在下载目录内（`..` 与符号链接都先 realpath 归一化再比较）。"""
+    if not DOWNLOAD_DIR or not path:
+        return False
+    try:
+        root = os.path.realpath(DOWNLOAD_DIR)
+        return os.path.commonpath([root, os.path.realpath(path)]) == root
+    except (OSError, ValueError):
+        return False  # 不同盘符（Windows）等无法比较的情况一律视为越界
+
+
 def _local_candidates(full_path: str, file_name: str) -> list[str]:
     """该文件下载后可能落地到本地的路径（BPCS 按 <savedir>/<账号>/<网盘路径> 镜像存放）。
 
     按「远程路径镜像」优先、文件名其次排序：不同用户的转存目录不同，
-    只按文件名比对会把别人下载的同名文件误判成本文件。"""
+    只按文件名比对会把别人下载的同名文件误判成本文件。
+    越界（`..`、绝对路径）的候选直接丢弃：它们可能指向下载目录之外的文件。"""
     candidates: list[str] = []
     account_folder = _get_account_folder()
     if account_folder:
         candidates.append(os.path.join(DOWNLOAD_DIR, account_folder, full_path.strip("/")))
         candidates.append(os.path.join(DOWNLOAD_DIR, account_folder, file_name))
     candidates.append(os.path.join(DOWNLOAD_DIR, file_name))
-    return candidates
+    return [p for p in candidates if _is_inside_download_dir(p)]
 
 
 def _size_matches(actual: int, expected: int) -> bool:
@@ -1990,9 +2117,14 @@ def _size_matches(actual: int, expected: int) -> bool:
     误差，且误差上限由**显示单位**决定：B 精确、KB 约 5 字节、MB 约 5KB、GB 约 5MB。这里按
     云端大小推断显示单位（BPCS 取不超过该体积的最大单位），取该单位的 1% 作容差——既覆盖
     显示舍入，又不会像固定比例那样随体积放宽到几十 MB（半截文件会被放行）。
-    expected <= 0 表示云端大小未知，一律放行（此时只能靠下载目录/清理清单兜底）。"""
+    expected <= 0 表示云端大小未知：这里只能放行，拦截交给调用方（未知大小按「本次下载期间
+    是否被写过」判断残留）。"""
     if expected <= 0:
         return True
+    if expected < 1024:
+        # B 量级 BPCS 显示的就是精确字节数，只留整数截断余量；留 8 字节的宽地板会把
+        # 「500B 少 5B」这类明显截断判成完整
+        return abs(actual - expected) <= 2
     unit = 1
     for candidate in (1024 ** 4, 1024 ** 3, 1024 ** 2, 1024):
         if expected >= candidate:
@@ -2032,9 +2164,13 @@ def _register_partial_download(full_path: str, file_name: str, is_dir: bool,
     else:
         for p in _local_candidates(full_path, file_name):
             try:
-                if os.path.isfile(p) and os.path.getmtime(p) >= started_at \
-                        and not _size_matches(os.path.getsize(p), file_size):
-                    paths.append(p)
+                if not os.path.isfile(p) or os.path.getmtime(p) < started_at:
+                    continue
+                # 大小未知（file_size<=0）时没法比对，只能按「本次下载期间被写过」认定残留：
+                # 宁可让用户重下一次，也不能把截断文件当完整内容发出去
+                if file_size > 0 and _size_matches(os.path.getsize(p), file_size):
+                    continue
+                paths.append(p)
             except OSError:
                 continue
     if paths:
@@ -2091,6 +2227,9 @@ class BaiduNetdiskPlugin(Star):
         self._background_tasks: set[asyncio.Task] = set()
         # 已受理但还没被事件循环调度的任务键：同一轮里重复的工具调用要能立刻被拦住
         self._pending_jobs: set[str] = set()
+        # 已受理（工具返回「已开始」）但下载还没登记的窗口内，占住这些用户不能被切换链接：
+        # 否则缓存被换掉，后台任务只能回「链接已切换」，用户先看到「已开始」再看到失败
+        self._switch_claims: set[str] = set()
 
         # 设置 BaiduPCS-Go 下载目录（exe 可用时才设置）
         if _ensure_bpcs_exe():
@@ -2164,7 +2303,8 @@ class BaiduNetdiskPlugin(Star):
             self._share_cache.pop(next(iter(self._share_cache)), None)
 
     def _user_has_active_download(self, user_id: str) -> bool:
-        return user_id in self._active_downloads.values()
+        """该用户是否有下载在途（含已受理但尚未登记下载的窗口，见 _switch_claims）。"""
+        return user_id in self._active_downloads.values() or user_id in self._switch_claims
 
     def _user_download_lock(self, user_id: str) -> asyncio.Lock:
         """该用户的下载串行锁：同一用户的两个下载任务排队执行。
@@ -2318,10 +2458,10 @@ class BaiduNetdiskPlugin(Star):
             await asyncio.sleep(1)
 
     async def _notify_user(self, event: AstrMessageEvent, text: str) -> bool:
-        """把后台任务的结果发给用户；失败时重试一次并把文本写进日志。
+        """把后台任务的结果发给用户；失败时重试一次并落盘 + 记日志。
 
         AI 工具早已返回「已受理」，此后用户能否拿到文件/结果全看这一次发送：失败就静默
-        丢弃的话，用户既拿不到文件也拿不到失败原因，所以重试并把内容留痕备查。"""
+        丢弃的话，用户既拿不到文件也拿不到失败原因。重试之外再落盘一份，用户下次交互补发。"""
         for attempt in (1, 2):
             try:
                 await event.send(event.plain_result(text))
@@ -2330,26 +2470,81 @@ class BaiduNetdiskPlugin(Star):
                 if attempt == 2:
                     logger.error(f"[baidu_netdisk] ❌ 后台结果发送失败（用户可能收不到）: {text}")
                     logger.error(f"[baidu_netdisk] ❌ 发送异常: {e}")
+                    try:
+                        _notice_queue(event.get_sender_id(), text)
+                    except Exception as queue_exc:
+                        # 落盘失败不能反过来把投递流程打挂：日志里已经留了结果文本
+                        logger.error(f"[baidu_netdisk] ❌ 记录待补发结果失败: {queue_exc}")
                 else:
                     await asyncio.sleep(2)
         return False
 
-    def _spawn_background_job(self, coro: Coroutine[object, object, None], dl_key: str = "") -> None:
+    async def _deliver_download_result(self, event: AstrMessageEvent, dl: dict,
+                                       share_url: str, label: str) -> None:
+        """把下载好的文件/文件夹发给用户；AI 工具任务与「命令被中断」的补发共用。"""
+        if dl.get("is_dir"):
+            # notify=False：这里是唯一一次发送，_send_folder 内部再发一次就是重复
+            text = await self._send_folder(event, dl, share_url, label=label, notify=False)
+            await self._notify_user(event, text)
+        elif await self._send_file(event, dl, share_url):
+            await self._notify_user(event, f"✅ 「{label}」下载并发送完成")
+        else:
+            await self._notify_user(event, f"📁 「{label}」已下载到 {dl['path']}，但发送失败")
+
+    def _schedule_interrupt_delivery(self, event: AstrMessageEvent, guard: "_DownloadGuard",
+                                     consumed: dict, share_url: str, label: str) -> None:
+        """「命令被中断」的补发入口（定时器回调，不是协程）：确认命令没接手才建补发任务。
+
+        future 完成时兜底回调可能比命令协程先被调度，那一刻命令还活着；所以先等一拍
+        （见调用处），到这里命令要么已经置位、要么已经被取消。"""
+        if consumed.get("by_command"):
+            return
+        self._spawn_background_job(
+            self._deliver_after_interrupt(event, guard, share_url, label))
+
+    async def _deliver_after_interrupt(self, event: AstrMessageEvent, guard: "_DownloadGuard",
+                                       share_url: str, label: str) -> None:
+        """命令被中断后补发下载结果（是否该补发已由 _schedule_interrupt_delivery 判定）。
+
+        结果取自 guard 而不是 future：future 可能已被调用方的取消连带取消。worker 还在跑时
+        就等着——它自身受下载超时约束，不会永远不结束。"""
+        while guard.outcome() is None:
+            await asyncio.sleep(_INTERRUPT_POLL_SECONDS)
+        ok, payload = guard.outcome()
+        if not ok:
+            await self._notify_user(event, f"❌ 下载任务异常: {payload}")
+            return
+        if not isinstance(payload, dict):
+            await self._notify_user(event, "❌ 下载任务异常：结果格式不正确")
+            return
+        if "error" in payload:
+            await self._notify_user(event, f"❌ {payload['error']}")
+            return
+        await self._deliver_download_result(event, payload, share_url, label)
+
+    def _spawn_background_job(self, coro: Coroutine[object, object, None], dl_key: str = "",
+                              claim_uid: str = "") -> None:
         """把耗时的转存/下载/发送丢进独立任务执行，并持有引用避免被 GC。
 
         LLM 工具的调用栈受框架 tool_call_timeout（默认 120 秒）约束，而一次转存加下载
         动辄几分钟到几小时：留在工具调用栈上必然被 wait_for 掐断，掐断时下载线程还在跑。
         独立任务不会被工具的取消连带取消，结果由任务自己直接发给用户。
         dl_key: 非空时登记「待执行」并在任务结束时注销——新建任务要等事件循环下一次调度才
-        会跑到 _begin_download，同一轮对话里的第二次工具调用必须能立刻看到它，否则会重复受理。"""
+        会跑到 _begin_download，同一轮对话里的第二次工具调用必须能立刻看到它，否则会重复受理。
+        claim_uid: 非空时在任务生命周期内占住该用户的「切链窗口」：受理之后、下载登记之前
+        用户若查看了别的链接，缓存就被换掉，任务只能报错（先是「已受理」再是「链接已切换」）。"""
         if dl_key:
             self._pending_jobs.add(dl_key)
+        if claim_uid:
+            self._switch_claims.add(claim_uid)
         try:
             task = asyncio.create_task(coro)
         except BaseException:
-            # 任务没建起来就注销，否则这个键会永远占着，之后同样的请求全被当成「正在下载中」
+            # 任务没建起来就注销，否则这些键会永远占着，之后同样的请求全被当成「正在下载中」
             if dl_key:
                 self._pending_jobs.discard(dl_key)
+            if claim_uid:
+                self._switch_claims.discard(claim_uid)
             raise
         self._background_tasks.add(task)
 
@@ -2357,6 +2552,8 @@ class BaiduNetdiskPlugin(Star):
             self._background_tasks.discard(t)
             if dl_key:
                 self._pending_jobs.discard(dl_key)
+            if claim_uid:
+                self._switch_claims.discard(claim_uid)
             if not t.cancelled():
                 exc = t.exception()
                 if exc is not None:
@@ -2668,7 +2865,8 @@ class BaiduNetdiskPlugin(Star):
         # 转存加下载动辄几分钟以上，远超框架默认 120 秒的工具超时：
         # 交给后台任务执行，结果由它自己发给用户（详见 _spawn_background_job）
         self._spawn_background_job(self._job_download_and_send(
-            event, uid, dl_key, folder_path, surl, pwd, cached["surl"] if not surl else ""), dl_key)
+            event, uid, dl_key, folder_path, surl, pwd, cached["surl"] if not surl else "",
+            switch_checked=True), dl_key, uid)
         return (f"已受理「{folder_path}」的下载，正在后台转存并下载，完成后会把文件直接发到这里"
                 f"（若前面已有下载任务，会先排队）。请告知用户已开始，不要重复调用本工具。")
 
@@ -2713,7 +2911,8 @@ class BaiduNetdiskPlugin(Star):
             return "⏳ 该文件正在下载中，请稍候..."
         # 与 pan_download_dir 同样的理由：实际工作在后台任务里跑，避免被工具超时掐断
         self._spawn_background_job(self._job_download_and_send(
-            event, uid, dl_key, "", surl, pwd, cached["surl"] if not surl else ""), dl_key)
+            event, uid, dl_key, "", surl, pwd, cached["surl"] if not surl else "",
+            switch_checked=True), dl_key, uid)
         return ("已受理「下载全部文件」，正在后台转存并下载，完成后会把文件直接发到这里"
                 "（若前面已有下载任务，会先排队）。请告知用户已开始，不要重复调用本工具。")
 
@@ -2759,14 +2958,15 @@ class BaiduNetdiskPlugin(Star):
             logger.warning(f"[baidu_netdisk] ⚠️ pan_transfer: duplicate blocked: {transfer_key}")
             return "⏳ 该转存正在进行中，请稍候..."
         self._spawn_background_job(self._job_transfer(
-            event, uid, path, surl, pwd, cached["surl"] if not surl else ""), transfer_key)
+            event, uid, path, surl, pwd, cached["surl"] if not surl else "",
+            switch_checked=True), transfer_key, uid)
         target = f"「{path}」" if path else "分享全部内容"
         return (f"已受理{target}的转存，完成后会把转存结果直接发给用户。"
                 "请告知用户已开始，不要重复调用本工具，也不要自己编造转存结果。")
 
     async def _job_download_and_send(self, event: AstrMessageEvent, uid: str, dl_key: str,
                                      folder_path: str, link: str, pwd: str,
-                                     cached_surl: str = "") -> None:
+                                     cached_surl: str = "", switch_checked: bool = False) -> None:
         """AI 工具的实际工作：查看链接（可选）→ 按需转存 → 下载 → 自动发送。
 
         在独立任务里执行（而不是留在工具调用栈上）：LLM 工具受框架 tool_call_timeout
@@ -2779,10 +2979,13 @@ class BaiduNetdiskPlugin(Star):
         try:
             surl = link
             if surl:
-                blocked = self._check_switch_allowed(surl, uid)
-                if blocked:
-                    await self._notify_user(event, f"❌ {blocked}")
-                    return
+                # switch_checked：工具已同步检查过并占住了切链窗口（_switch_claims），
+                # 这里再查一次只会看到自己的占位，把正常请求误判成「别人在下载」
+                if not switch_checked:
+                    blocked = self._check_switch_allowed(surl, uid)
+                    if blocked:
+                        await self._notify_user(event, f"❌ {blocked}")
+                        return
                 result = await asyncio.to_thread(self._transfer_and_list, surl, pwd, uid)
                 if "error" in result:
                     await self._notify_user(event, f"❌ {result['error']}")
@@ -2825,14 +3028,7 @@ class BaiduNetdiskPlugin(Star):
                     await self._notify_user(event, f"❌ {dl['error']}")
                     return
                 share_url = f"https://pan.baidu.com/s/{surl}"
-                if dl.get("is_dir"):
-                    # notify=False：降级文本由这里发一次，避免内部发送后再发一遍
-                    text = await self._send_folder(event, dl, share_url, label=label, notify=False)
-                    await self._notify_user(event, text)
-                elif await self._send_file(event, dl, share_url):
-                    await self._notify_user(event, f"✅ 「{label}」下载并发送完成")
-                else:
-                    await self._notify_user(event, f"📁 「{label}」已下载到 {dl['path']}，但发送失败")
+                await self._deliver_download_result(event, dl, share_url, label)
             finally:
                 if dl_future is None:
                     guard.abandon()  # worker 还没启动，立即归还锁与下载通道
@@ -2847,7 +3043,8 @@ class BaiduNetdiskPlugin(Star):
             await self._notify_user(event, f"❌ 下载任务异常: {e}")
 
     async def _job_transfer(self, event: AstrMessageEvent, uid: str, path: str,
-                            link: str, pwd: str, cached_surl: str = "") -> None:
+                            link: str, pwd: str, cached_surl: str = "",
+                            switch_checked: bool = False) -> None:
         """AI 工具「转存」的实际工作，在独立任务里执行（理由同 _job_download_and_send）。
 
         link 为空时改用 cached_surl（工具受理那一刻的缓存快照），本任务不重读缓存，
@@ -2855,10 +3052,12 @@ class BaiduNetdiskPlugin(Star):
         try:
             surl = link
             if surl:
-                blocked = self._check_switch_allowed(surl, uid)
-                if blocked:
-                    await self._notify_user(event, f"❌ {blocked}")
-                    return
+                # 同 _job_download_and_send：工具已同步检查并占位，这里不重复检查自己
+                if not switch_checked:
+                    blocked = self._check_switch_allowed(surl, uid)
+                    if blocked:
+                        await self._notify_user(event, f"❌ {blocked}")
+                        return
                 result = await asyncio.to_thread(self._transfer_and_list, surl, pwd, uid)
                 if "error" in result:
                     await self._notify_user(event, f"❌ {result['error']}")
@@ -3117,6 +3316,9 @@ class BaiduNetdiskPlugin(Star):
         if self._is_blacklisted(event):
             return
         uid = event.get_sender_id()
+        # 之前发送失败的结果在这里补发：机器人掉线时用户收不到任何提示，只能等他下次说话
+        for notice in _notice_take(uid):
+            yield event.plain_result(f"📬 之前有一条结果没能送达，补发如下：\n{notice}")
         dl_key = f"{uid}:{str(args).strip()}"
         parts = [p for p in str(args).split() if p]
         if not parts or parts[0] == "help":
@@ -3287,6 +3489,18 @@ class BaiduNetdiskPlugin(Star):
                 dl_future = guard.start(
                     download_from_cloud, tr["name"], self._get_max_mb(), prog_q,
                     self._cloud_dir_for(uid), _user_bucket(uid))
+                share_url = f"https://pan.baidu.com/s/{cached['surl']}"
+                consumed: dict = {"by_command": False}
+
+                def _fallback_delivery(fut: asyncio.Future) -> None:
+                    # 命令被框架中断（生成器关闭、插件重载）时 await 会被取消，下载结果就再没人发送。
+                    # 这里只约一个「稍后确认」的定时器（不立刻建任务）：命令正常接手时它什么都不做，
+                    # 被中断时才建补发任务，避免与正常路径重复发送
+                    asyncio.get_running_loop().call_later(
+                        1.0, self._schedule_interrupt_delivery,
+                        event, guard, consumed, share_url, dl_path)
+
+                dl_future.add_done_callback(_fallback_delivery)
                 if prog_q:
                     file_info = None
                     _last_prog_size = None
@@ -3337,12 +3551,12 @@ class BaiduNetdiskPlugin(Star):
                                         _last_prog_time = now
                         await self._interruptible_sleep(dl_future, self._progress_interval)
                 dl = await dl_future
+                consumed["by_command"] = True  # 命令自己会发送，兜底补发到此为止
                 logger.info(f"[baidu_netdisk] on_pan down: download complete, dl={dl}")
                 if "error" in dl:
                     logger.error(f"[baidu_netdisk] ❌ on_pan down: download error: {dl['error']}")
                     yield event.plain_result(f"❌ {dl['error']}")
                 else:
-                    share_url = f"https://pan.baidu.com/s/{cached['surl']}"
                     if dl.get("is_dir"):
                         # 文件夹不能直接发送：≤阈值逐个发，否则打包 zip，超限则降级为路径+清单。
                         # notify=False：这里会把返回文本 yield 给用户，内部再发一次就是重复发送
@@ -3357,9 +3571,9 @@ class BaiduNetdiskPlugin(Star):
                 if dl_future is None:
                     guard.abandon()  # worker 还没启动，立即归还锁与下载通道
                 elif not dl_future.done():
-                    # 命令被中断（插件重载/框架关闭生成器）时 worker 仍会把文件下完，但结果没人发送：
-                    # 留一条日志，至少让管理员知道去哪儿找，而不是以为下载失败了
-                    logger.warning("[baidu_netdisk] ⚠️ 命令被中断，下载仍在后台继续但不会自动发送; "
+                    # 命令被中断（插件重载/框架关闭生成器）时 worker 仍会把文件下完，
+                    # 结果由 _fallback_delivery 挂的补发任务送出；这里只留一条日志便于排查
+                    logger.warning("[baidu_netdisk] ⚠️ 命令被中断，下载仍在后台继续，完成后会自动补发结果; "
                                    f"文件在下载目录 {DOWNLOAD_DIR} 下按网盘路径查找")
             return
 
