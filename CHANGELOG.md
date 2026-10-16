@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### 变更
+- 插件英文标识统一为 `astrbot_plugin_baidu_netdisk`：插件注册名与插件市场搜索词不再出现旧名 `baidu_pan`；已下载文件与插件数据不受影响
 - 重排 README：按「功能 / 指令 / 配置 / 其它」四板块组织，头部改为插件名 + 描述 + 标签区块；功能条目精简为能力描述，移除内部存储路径等实现细节
 - README 新增版本（取 git tag）/ 许可证 / 平台徽章，并写明 Windows、Linux、macOS 全平台可用
 

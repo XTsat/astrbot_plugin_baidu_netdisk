@@ -184,18 +184,18 @@ def _auto_download_bpcs() -> bool:
     if _ensure_bpcs_exe():
         return True
     if _auto_dl_failed:
-        logger.warning("[BaiduPan] BaiduPCS-Go 不可用且此前自动下载失败，跳过自动下载（可用 /pan pcs 手动重试）")
+        logger.warning("[baidu_netdisk] BaiduPCS-Go 不可用且此前自动下载失败，跳过自动下载（可用 /pan pcs 手动重试）")
         return False
     with _auto_dl_lock:
         if _ensure_bpcs_exe():
             return True
         if _auto_dl_failed:
             return False
-        logger.info("[BaiduPan] BaiduPCS-Go 不存在或不可用，开始自动下载...")
+        logger.info("[baidu_netdisk] BaiduPCS-Go 不存在或不可用，开始自动下载...")
         result = _download_github_exe()
         gh_err = result["error"] if "error" in result else ""
         if "error" in result:
-            logger.warning(f"[BaiduPan] GitHub 自动下载失败，回退国内镜像: {result['error']}")
+            logger.warning(f"[baidu_netdisk] GitHub 自动下载失败，回退国内镜像: {result['error']}")
             result = _download_cn_exe()
         if "error" in result:
             _auto_dl_failed = True
@@ -205,7 +205,7 @@ def _auto_download_bpcs() -> bool:
                     f"国内镜像: {result['error']}",
                 ) if part
             )
-            logger.error(f"[BaiduPan] BaiduPCS-Go 自动下载失败: {_auto_dl_last_error}")
+            logger.error(f"[baidu_netdisk] BaiduPCS-Go 自动下载失败: {_auto_dl_last_error}")
             return False
         _auto_dl_failed = False
         _auto_dl_last_error = ""
@@ -232,14 +232,14 @@ def _set_github_proxy(proxy: str) -> str | None:
         with open(_GITHUB_PROXY_FILE, "w", encoding="utf-8") as f:
             f.write(proxy)
     except Exception as e:
-        logger.warning(f"[BaiduPan] 保存 GitHub 加速代理失败（{e}），本次会话内仍生效")
+        logger.warning(f"[baidu_netdisk] 保存 GitHub 加速代理失败（{e}），本次会话内仍生效")
     return None
 
 
 def _fetch_release_info(proxy: str = "") -> dict | None:
     """从 GitHub API 获取官方 release 信息（下载 URL 和文件大小来自官方，不硬编码）。
     proxy 非空时通过加速代理访问 API（如 https://gh-proxy.org/https://api.github.com/...）。"""
-    headers = {"User-Agent": "astrbot_plugin_baidu_pan", "Accept": "application/vnd.github+json"}
+    headers = {"User-Agent": "astrbot_plugin_baidu_netdisk", "Accept": "application/vnd.github+json"}
     api_url = _proxied_url(proxy, BPCS_API_URL)
     try:
         resp = _req.get(api_url, timeout=30, headers=headers)
@@ -253,10 +253,10 @@ def _fetch_release_info(proxy: str = "") -> dict | None:
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
-            logger.error(f"[BaiduPan] 获取 GitHub release 信息失败: {e}")
+            logger.error(f"[baidu_netdisk] 获取 GitHub release 信息失败: {e}")
             return None
     except Exception as e:
-        logger.error(f"[BaiduPan] 获取 GitHub release 信息失败: {e}")
+        logger.error(f"[baidu_netdisk] 获取 GitHub release 信息失败: {e}")
         return None
 
 
@@ -266,7 +266,7 @@ def _download_cn_exe() -> dict:
     if not _IS_WINDOWS:
         return {"error": "国内镜像仅提供 Windows 版 BaiduPCS-Go，当前平台请从 GitHub 官方 release 下载"}
     def _get(url: str, timeout: int = 300) -> bytes | None:
-        headers = {"User-Agent": "astrbot_plugin_baidu_pan"}
+        headers = {"User-Agent": "astrbot_plugin_baidu_netdisk"}
         try:
             r = _req.get(url, timeout=timeout, headers=headers)
             r.raise_for_status()
@@ -283,7 +283,7 @@ def _download_cn_exe() -> dict:
         except Exception:
             return None
 
-    logger.info("[BaiduPan] 尝试从国内镜像下载 BaiduPCS-Go.exe...")
+    logger.info("[baidu_netdisk] 尝试从国内镜像下载 BaiduPCS-Go.exe...")
     data = _get(BPCS_CN_URL, timeout=120)
     if data is None:
         return {"error": "国内镜像下载失败（网络不可达）"}
@@ -294,7 +294,7 @@ def _download_cn_exe() -> dict:
     try:
         with open(BPCS_PATH, "wb") as f:
             f.write(data)
-        logger.info(f"[BaiduPan] 国内镜像下载成功（{len(data)} bytes）")
+        logger.info(f"[baidu_netdisk] 国内镜像下载成功（{len(data)} bytes）")
         return {"ok": True}
     except Exception as e:
         return {"error": f"写入 exe 失败: {e}"}
@@ -311,7 +311,7 @@ def _download_github_exe(proxy: str | None = None, max_attempts: int = 3) -> dic
         proxy = _github_proxy
 
     def _get(url: str, timeout: int = 300) -> bytes | None:
-        headers = {"User-Agent": "astrbot_plugin_baidu_pan"}
+        headers = {"User-Agent": "astrbot_plugin_baidu_netdisk"}
         try:
             r = _req.get(url, timeout=timeout, headers=headers)
             r.raise_for_status()
@@ -352,7 +352,7 @@ def _download_github_exe(proxy: str | None = None, max_attempts: int = 3) -> dic
         if attempt > 1:
             time.sleep(1.0 * (attempt - 1))  # 1s/2s 退避，给瞬时故障留恢复时间
         via = f"通过加速代理 {proxy} " if proxy else ""
-        logger.info(f"[BaiduPan] {via}从 GitHub 官方 release 下载 BaiduPCS-Go {tag}（{suffix}，第 {attempt}/{max_attempts} 次尝试）...")
+        logger.info(f"[baidu_netdisk] {via}从 GitHub 官方 release 下载 BaiduPCS-Go {tag}（{suffix}，第 {attempt}/{max_attempts} 次尝试）...")
         data = _get(download_url, timeout=300)
         if data is None:
             last_err = "GitHub 下载失败（连接超时/被重置，请检查网络后重试）"
@@ -391,7 +391,7 @@ def _download_github_exe(proxy: str | None = None, max_attempts: int = 3) -> dic
                 f.write(exe_data)
             if not _IS_WINDOWS:
                 os.chmod(BPCS_PATH, 0o755)  # zip 不保留可执行位，POSIX 需手动加上
-            logger.info(f"[BaiduPan] GitHub 下载成功（{len(exe_data)} bytes, {tag}, {suffix}）")
+            logger.info(f"[baidu_netdisk] GitHub 下载成功（{len(exe_data)} bytes, {tag}, {suffix}）")
             return {"ok": True}
         except Exception as e:
             return {"error": f"写入 exe 失败: {e}"}  # 写盘失败重试无意义，直接返回
@@ -420,14 +420,14 @@ def _init_bpcs() -> bool:
         if _bpcs_inited:
             return True
         if not _ensure_bpcs_exe():
-            logger.warning(f"[BaiduPan] {_BPCS_EXE_NAME} 不可用，登录时会自动尝试下载，也可用 /pan pcs 手动下载")
+            logger.warning(f"[baidu_netdisk] {_BPCS_EXE_NAME} 不可用，登录时会自动尝试下载，也可用 /pan pcs 手动下载")
             return False
         out, _, code = _run_bpcs(["who"], timeout=15)
         if code == 0 and out and "登录" not in (out or "") and "未登录" not in (out or ""):
             _bpcs_inited = True
-            logger.info(f"[BaiduPan] BaiduPCS-Go already logged in: {out.strip()[:100]}")
+            logger.info(f"[baidu_netdisk] BaiduPCS-Go already logged in: {out.strip()[:100]}")
             return True
-        logger.info("[BaiduPan] BaiduPCS-Go not logged in, use /pan login")
+        logger.info("[baidu_netdisk] BaiduPCS-Go not logged in, use /pan login")
         return False
 
 
@@ -471,7 +471,7 @@ def login_bduss_bpcs(bduss: str, stoken: str = "") -> dict:
     text = (out or "") + chr(10) + (err or "")
     if code == 0 and "失败" not in text and "错误" not in text:
         _bpcs_inited = True
-        logger.info("[BaiduPan] BaiduPCS-Go logged in via /pan login 3/bduss")
+        logger.info("[baidu_netdisk] BaiduPCS-Go logged in via /pan login 3/bduss")
         return {"success": True}
     m = re.search(r"错误代码:\s*\d+[^\n]{0,60}|[\u4e00-\u9fa5]{2,20}[:：]?\s*[^\n]{0,60}", text)
     if m:
@@ -484,7 +484,7 @@ def _patch_config_stoken(stoken: str, bduss: str = ""):
     login -cookies= 不会自动填充 stoken 字段，但 transfer 需要它。"""
     config_path = _bpcs_config_path()
     if not os.path.exists(config_path):
-        logger.warning(f"[BaiduPan] pcs_config.json not found at {config_path}")
+        logger.warning(f"[baidu_netdisk] pcs_config.json not found at {config_path}")
         return
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -497,9 +497,9 @@ def _patch_config_stoken(stoken: str, bduss: str = ""):
                 user_list[0]["bduss"] = bduss
             with open(config_path, "w", encoding="utf-8") as f:
                 _json.dump(cfg, f, ensure_ascii=False, indent=4)
-            logger.info(f"[BaiduPan] patched stoken into config")
+            logger.info(f"[baidu_netdisk] patched stoken into config")
     except Exception as e:
-        logger.warning(f"[BaiduPan] failed to patch config: {e}")
+        logger.warning(f"[baidu_netdisk] failed to patch config: {e}")
 
 
 def login_cookies_bpcs(cookie_str: str) -> dict:
@@ -522,7 +522,7 @@ def login_cookies_bpcs(cookie_str: str) -> dict:
         if stoken_m:
             _patch_config_stoken(stoken_m.group(1), bduss_m.group(1) if bduss_m else "")
         _bpcs_inited = True
-        logger.info("[BaiduPan] BaiduPCS-Go logged in via cookies")
+        logger.info("[baidu_netdisk] BaiduPCS-Go logged in via cookies")
         return {"success": True}
     m = re.search(r"错误代码:\s*\d+[^\n]{0,60}|[\u4e00-\u9fa5]{2,20}[:：]?\s*[^\n]{0,60}", text)
     if m:
@@ -549,11 +549,11 @@ def login_bpcs(username: str, password: str) -> dict:
         text = (out_bytes or b"").decode("utf-8", errors="replace")
         if proc.returncode == 0 and "失败" not in text and "错误" not in text:
             _bpcs_inited = True
-            logger.info("[BaiduPan] BaiduPCS-Go logged in via /pan login 2/pwd (stdin)")
+            logger.info("[baidu_netdisk] BaiduPCS-Go logged in via /pan login 2/pwd (stdin)")
             return {"success": True, "output": text.strip()[:300]}
-        logger.info(f"[BaiduPan] stdin login 未成功，回退参数方式: rc={proc.returncode}")
+        logger.info(f"[baidu_netdisk] stdin login 未成功，回退参数方式: rc={proc.returncode}")
     except Exception as e:
-        logger.warning(f"[BaiduPan] stdin login 异常，回退参数方式: {e}")
+        logger.warning(f"[baidu_netdisk] stdin login 异常，回退参数方式: {e}")
 
     # 方式二：参数式（兜底）
     out, err, code = _run_bpcs(
@@ -562,7 +562,7 @@ def login_bpcs(username: str, password: str) -> dict:
     text = (out or "") + chr(10) + (err or "")
     if code == 0 and "失败" not in text and "错误" not in text:
         _bpcs_inited = True
-        logger.info("[BaiduPan] BaiduPCS-Go logged in via /pan login 2/pwd")
+        logger.info("[baidu_netdisk] BaiduPCS-Go logged in via /pan login 2/pwd")
         return {"success": True, "output": text.strip()[:300]}
     m = re.search(r"[\u4e00-\u9fa5]{2,20}[:：]?\s*[0-9a-zA-Z\u4e00-\u9fa5 ,.()]+", text)
     if m:
@@ -579,7 +579,7 @@ def logout_bpcs() -> dict:
     text = (out or "") + chr(10) + (err or "")
     if code == 0:
         _bpcs_inited = False
-        logger.info("[BaiduPan] BaiduPCS-Go logged out via /pan login out")
+        logger.info("[baidu_netdisk] BaiduPCS-Go logged out via /pan login out")
         return {"success": True}
     return {"error": f"退出失败（退出码 {code}）: {text.strip()[:200]}"}
 
@@ -589,7 +589,7 @@ def _build_pan_session() -> object:
     自动访问 pan.baidu.com/disk/main 获取 csrfToken / PANPSC 等 pan 专用 cookie。"""
     cfg_path = _bpcs_config_path()
     if not os.path.exists(cfg_path):
-        logger.warning("[BaiduPan] pcs_config.json not found, cannot build pan session")
+        logger.warning("[baidu_netdisk] pcs_config.json not found, cannot build pan session")
         return None
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
@@ -597,10 +597,10 @@ def _build_pan_session() -> object:
         user = cfg.get("baidu_user_list", [{}])[0]
         cookies_str = user.get("cookies", "") or user.get("bduss", "")
         if not cookies_str:
-            logger.warning("[BaiduPan] no cookies/bduss in config")
+            logger.warning("[baidu_netdisk] no cookies/bduss in config")
             return None
     except Exception as e:
-        logger.warning(f"[BaiduPan] failed to read config: {e}")
+        logger.warning(f"[baidu_netdisk] failed to read config: {e}")
         return None
 
     sess = _req.Session()
@@ -651,7 +651,7 @@ def _get_bdstoken(sess) -> str:
         if j.get("errno") == 0:
             return (j.get("result") or {}).get("bdstoken", "")
     except Exception as e:
-        logger.warning(f"[BaiduPan] gettemplatevariable 失败: {e}")
+        logger.warning(f"[baidu_netdisk] gettemplatevariable 失败: {e}")
     return ""
 
 
@@ -670,7 +670,7 @@ def _resolve_share_via_page(sess, surl: str, share_link: str) -> dict:
                     # 正常分享页 1s 左右响应；两次都读超时基本是分享已在服务端失效
                     return {"error": "分享页无响应（重试仍超时），该分享链接很可能已失效，请让分享者重新分享"}
                 raise
-            logger.warning(f"[BaiduPan] 分享页请求失败，重试: {e}")
+            logger.warning(f"[baidu_netdisk] 分享页请求失败，重试: {e}")
             time.sleep(1)
     if _grab_share_field(r.text, "loginstate") == "0":
         return {"error": "网盘未登录，请使用 /pan login 1 重新登录"}
@@ -704,7 +704,7 @@ def _share_api_preflight(sess, surl: str, pwd: str, share_link: str) -> dict:
             return {"error": f"分享链接无效或已失效（{show}）"}
     except (_req.exceptions.RequestException, ValueError) as e:
         # 仅网络层失败才回退分享页解析（接口明确返回 errno 时链接就是无效的）
-        logger.warning(f"[BaiduPan] shorturlinfo 请求失败，回退分享页解析: {e}")
+        logger.warning(f"[baidu_netdisk] shorturlinfo 请求失败，回退分享页解析: {e}")
         page = _resolve_share_via_page(sess, surl, share_link)
         if "error" in page:
             return page
@@ -751,7 +751,7 @@ def _api_dir_list_errno(sess, bdstoken: str, dir_path: str) -> int:
             headers={"Referer": "https://pan.baidu.com/disk/main"}, timeout=15)
         return int(r.json().get("errno", -1))
     except Exception as e:
-        logger.warning(f"[BaiduPan] api/list 检查目录 {dir_path} 失败: {e}")
+        logger.warning(f"[baidu_netdisk] api/list 检查目录 {dir_path} 失败: {e}")
         return -1
 
 
@@ -783,13 +783,13 @@ def _ensure_remote_dir(sess, bdstoken: str, target_path: str) -> str:
                          "Content-Type": "application/x-www-form-urlencoded"},
                 timeout=20).json()
         except Exception as e:
-            logger.warning(f"[BaiduPan] 创建网盘目录 {cur} 失败: {e}")
+            logger.warning(f"[baidu_netdisk] 创建网盘目录 {cur} 失败: {e}")
             return f"创建网盘目录 {cur} 失败: {e}"
         if r.get("errno") != 0:
             show = r.get("show_msg") or r.get("errno")
-            logger.warning(f"[BaiduPan] 创建网盘目录 {cur} 失败: {show}")
+            logger.warning(f"[baidu_netdisk] 创建网盘目录 {cur} 失败: {show}")
             return f"创建网盘目录 {cur} 失败(errno={show})"
-        logger.info(f"[BaiduPan] 已自动创建网盘转存目录: {cur}")
+        logger.info(f"[baidu_netdisk] 已自动创建网盘转存目录: {cur}")
     return ""
 
 
@@ -814,7 +814,7 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str, fs_ids: list = None
             return pf
         shareid, share_uk = pf["shareid"], pf["uk"]
         bdstoken, short = pf["bdstoken"], pf["short"]
-        logger.info(f"[BaiduPan] transfer: shareid={shareid}, uk={share_uk}, fs_ids={fs_ids or '全部'}")
+        logger.info(f"[baidu_netdisk] transfer: shareid={shareid}, uk={share_uk}, fs_ids={fs_ids or '全部'}")
 
         filenames = []
         if not fs_ids:
@@ -835,7 +835,7 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str, fs_ids: list = None
                 return {"error": "分享链接中没有文件"}
             fs_ids = [str(f.get("fs_id")) for f in files if f.get("fs_id")]
             filenames = [f.get("server_filename") for f in files]
-            logger.info(f"[BaiduPan] transfer files: {filenames}")
+            logger.info(f"[baidu_netdisk] transfer files: {filenames}")
 
         # Step 4.5: 确保转存目标目录存在（新账号/首次使用网盘里通常还没有该目录，
         # 缺失时 share/transfer 返回 errno=2「转存路径不存在」导致下载误报「路径不存在」）
@@ -860,7 +860,7 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str, fs_ids: list = None
         resp5 = r5.json()
         errno = resp5.get("errno", -1)
         if errno == 0:
-            logger.info(f"[BaiduPan] transfer success: {filenames}")
+            logger.info(f"[baidu_netdisk] transfer success: {filenames}")
             return {"success": True, "filenames": filenames, "fs_ids": fs_ids}
         elif errno == 2:
             # errno=2 是「转存路径不存在」（目标目录缺失，目录已在 Step 4.5 自动创建，
@@ -868,7 +868,7 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str, fs_ids: list = None
             # 直接放行，导致后续下载报误导性的「路径不存在」。此处如实报错。
             # 注：百度对「不能转存自己的分享」也可能返回 errno=2。
             show = (resp5.get("show_msg") or "").strip()
-            logger.warning(f"[BaiduPan] transfer errno=2, show_msg={show or '(空)'}")
+            logger.warning(f"[baidu_netdisk] transfer errno=2, show_msg={show or '(空)'}")
             if "路径不存在" in show or "不存在" in show:
                 return {"error": f"转存失败：目标目录 {target_path} 创建失败或不存在（{show}）"}
             return {"error": f"转存失败(errno=2): {show or '不能转存自己的分享（同一账号限制）'}。"
@@ -876,7 +876,7 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str, fs_ids: list = None
         elif errno == 4:
             # errno=4: 目标目录里已有这些文件（之前转存过/重复转存），
             # duplicated 列表中的文件就是云端已存在的目标文件，可以直接继续下载
-            logger.info(f"[BaiduPan] transfer errno=4 (already exists), filenames={filenames}")
+            logger.info(f"[baidu_netdisk] transfer errno=4 (already exists), filenames={filenames}")
             return {"success": True, "filenames": filenames, "fs_ids": fs_ids}
         elif errno == 12:
             # 按 info 里的具体 errno 区分：-30 同名已存在 / -32 空间不足
@@ -884,7 +884,7 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str, fs_ids: list = None
             errnos = [item.get("errno") for item in info]
             if errnos and all(e in (-30, 0) for e in errnos):
                 # 目标目录已有同名文件（多为之前已转存过），文件已在云端即可继续
-                logger.info(f"[BaiduPan] transfer errno=12 (same-name exists), filenames={filenames}")
+                logger.info(f"[baidu_netdisk] transfer errno=12 (same-name exists), filenames={filenames}")
                 return {"success": True, "filenames": filenames, "fs_ids": fs_ids}
             if -32 in errnos or "空间不足" in (resp5.get("show_msg") or ""):
                 need_gb = (resp5.get("target_size") or 0) / 1024 ** 3
@@ -896,7 +896,7 @@ def _transfer_via_api(surl: str, pwd: str, target_path: str, fs_ids: list = None
             return {"error": f"转存失败(errno={errno}): {show_msg}"}
 
     except Exception as e:
-        logger.exception(f"[BaiduPan] transfer API error: {e}")
+        logger.exception(f"[baidu_netdisk] transfer API error: {e}")
         return {"error": f"转存API调用异常: {e}"}
 
 
@@ -916,7 +916,7 @@ def _manifest_save(paths: set):
         with open(_MANIFEST_PATH, "w", encoding="utf-8") as f:
             _json.dump({"files": sorted(paths)}, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.warning(f"[BaiduPan] save cleanup manifest failed: {e}")
+        logger.warning(f"[baidu_netdisk] save cleanup manifest failed: {e}")
 
 
 def _manifest_add(paths: list):
@@ -942,21 +942,21 @@ def _cleanup_local_dir():
             elif os.path.exists(p):
                 remain.add(p)  # 目录等非普通文件，保留不动
         except Exception as e:
-            logger.warning(f"[BaiduPan] cleanup skip {p}: {e}")
+            logger.warning(f"[baidu_netdisk] cleanup skip {p}: {e}")
             remain.add(p)
     _manifest_save(remain)
     if removed:
-        logger.info(f"[BaiduPan] local cleanup: removed {removed} plugin-downloaded files")
+        logger.info(f"[baidu_netdisk] local cleanup: removed {removed} plugin-downloaded files")
 
 
 def _schedule_local_cleanup(hour: int):
     """安排每天定时清理本地下载文件（仅清理插件自己下载的文件）。"""
     global _cleanup_thread_started
     if hour < 0 or hour > 23:
-        logger.info("[BaiduPan] local auto-cleanup disabled")
+        logger.info("[baidu_netdisk] local auto-cleanup disabled")
         return
     if _cleanup_thread_started:
-        logger.info("[BaiduPan] local cleanup thread already running, skip")
+        logger.info("[baidu_netdisk] local cleanup thread already running, skip")
         return
     _cleanup_thread_started = True
 
@@ -972,7 +972,7 @@ def _schedule_local_cleanup(hour: int):
             time.sleep(60)
 
     threading.Thread(target=_worker, daemon=True, name="baidupan-cleanup").start()
-    logger.info(f"[BaiduPan] scheduled local cleanup at {hour}:00 daily")
+    logger.info(f"[baidu_netdisk] scheduled local cleanup at {hour}:00 daily")
 
 
 # 从任意文本（含整段中文分享文案）中提取分享链接与提取码
@@ -1100,10 +1100,10 @@ def _list_share_tree_api(surl: str, pwd: str) -> dict:
             lst = j.get("list") or []
             if j.get("errno") != 0 and dir_rel:
                 lines.append(f"{'  ' * depth}⚠️ 子目录 {dir_rel} 获取失败(errno={j.get('errno')})")
-                logger.warning(f"[BaiduPan] share/list {dir_rel} errno={j.get('errno')}")
+                logger.warning(f"[baidu_netdisk] share/list {dir_rel} errno={j.get('errno')}")
                 return
         except Exception as e:
-            logger.warning(f"[BaiduPan] share/list {dir_rel or '根目录'} 失败: {e}")
+            logger.warning(f"[baidu_netdisk] share/list {dir_rel or '根目录'} 失败: {e}")
             return
         prefix = "  " * depth
         for f in lst[:60]:
@@ -1151,7 +1151,7 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
         full_path = cloud_dir
         file_name = "全部文件"
 
-    logger.info(f"[BaiduPan] download_from_cloud: cloud_path={cloud_path}, full_path={full_path}")
+    logger.info(f"[baidu_netdisk] download_from_cloud: cloud_path={cloud_path}, full_path={full_path}")
 
     is_dir = not cloud_path
     file_size = 0
@@ -1178,7 +1178,7 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
             return {"error": f"云端路径不存在: {cloud_path}"}
         is_dir = found[2]
         file_size = 0 if is_dir else _parse_size_bytes(found[1])
-    logger.info(f"[BaiduPan] download_from_cloud: is_dir={is_dir}, file_size={file_size} ({file_size/1024/1024:.1f}MB)")
+    logger.info(f"[baidu_netdisk] download_from_cloud: is_dir={is_dir}, file_size={file_size} ({file_size/1024/1024:.1f}MB)")
 
     # 大小限制（仅单文件）
     max_bytes = max_mb * 1024 * 1024
@@ -1194,7 +1194,7 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
         check_paths.append(os.path.join(DOWNLOAD_DIR, file_name))
         for p in check_paths:
             if os.path.exists(p):
-                logger.info(f"[BaiduPan] file already exists locally: {p}")
+                logger.info(f"[baidu_netdisk] file already exists locally: {p}")
                 return {"path": p, "name": file_name, "size": os.path.getsize(p), "is_dir": False}
 
     # 下载（使用 subprocess.Popen 实时读输出，避免 BPCS 卡住）
@@ -1203,7 +1203,7 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
         dl_timeout = DOWNLOAD_TIMEOUT_SECONDS
     else:
         dl_timeout = max(600, int(file_size / (1024 * 1024) * 15)) if not is_dir else 3600
-    logger.info(f"[BaiduPan] download_from_cloud: starting download, dl_timeout={dl_timeout}s, progress_queue={progress_queue is not None}")
+    logger.info(f"[baidu_netdisk] download_from_cloud: starting download, dl_timeout={dl_timeout}s, progress_queue={progress_queue is not None}")
     # 把文件信息塞进队列，给 handler 监控文件大小用
     # 如果 file_size 为0但文件非目录，把 0 也塞进去，让 handler 监控时用实际文件大小
     if progress_queue is not None and not is_dir:
@@ -1232,7 +1232,7 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
             out = out.decode("utf-8", errors="replace")
         code = proc.returncode
     except subprocess.TimeoutExpired:
-        logger.error(f"[BaiduPan] download timeout ({dl_timeout}s), killing process")
+        logger.error(f"[baidu_netdisk] download timeout ({dl_timeout}s), killing process")
         # 超时后必须 kill，否则 BPCS 会继续在后台下载
         proc.kill()
         try:
@@ -1243,19 +1243,19 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
             progress_queue.put(("_error", "下载超时"))
         return {"error": "下载超时"}
     except Exception as e:
-        logger.error(f"[BaiduPan] download subprocess error: {e}")
+        logger.error(f"[baidu_netdisk] download subprocess error: {e}")
         return {"error": f"下载进程异常: {e}"}
     if code != 0 or "失败" in (out or "") or "错误" in (out or ""):
-        logger.error(f"[BaiduPan] download failed: code={code}, out={(out or '')[:200]}")
+        logger.error(f"[baidu_netdisk] download failed: code={code}, out={(out or '')[:200]}")
         if progress_queue is not None:
             progress_queue.put(("_error", f"下载失败 (code={code})"))
         return {"error": "下载失败"}
-    logger.info(f"[BaiduPan] download_from_cloud: download completed, code={code}")
+    logger.info(f"[baidu_netdisk] download_from_cloud: download completed, code={code}")
 
     if not DOWNLOAD_DIR:
         return {"error": "下载目录未设置"}
 
-    logger.info(f"[BaiduPan] download_from_cloud: searching for downloaded file, DOWNLOAD_DIR={DOWNLOAD_DIR}")
+    logger.info(f"[baidu_netdisk] download_from_cloud: searching for downloaded file, DOWNLOAD_DIR={DOWNLOAD_DIR}")
     if is_dir:
         downloaded = []
 
@@ -1390,13 +1390,13 @@ def _get_local_file_size(file_name: str) -> int:
 
 
 @register(
-    "astrbot_plugin_baidu_pan",
+    "astrbot_plugin_baidu_netdisk",
     "XTsat",
     "百度网盘分享文件自动下载发送",
     "2.0.0",
     "https://github.com/XTsat/astrbot_plugin_baidu_netdisk",
 )
-class BaiduPanPlugin(Star):
+class BaiduNetdiskPlugin(Star):
 
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
@@ -1411,10 +1411,10 @@ class BaiduPanPlugin(Star):
         try:
             os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         except Exception as e:
-            logger.warning(f"[BaiduPan] 配置的 download_dir ({DOWNLOAD_DIR}) 不可用 ({e})，回退到默认路径")
+            logger.warning(f"[baidu_netdisk] 配置的 download_dir ({DOWNLOAD_DIR}) 不可用 ({e})，回退到默认路径")
             DOWNLOAD_DIR = os.path.join(PLUGIN_DATA_DIR, "downloads")
             os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        logger.info(f"[BaiduPan] download dir: {DOWNLOAD_DIR}")
+        logger.info(f"[baidu_netdisk] download dir: {DOWNLOAD_DIR}")
 
         global CLOUD_SAVE_DIR
         cloud_dir = str(self.config.get("cloud_save_dir", "")).strip()
@@ -1422,7 +1422,7 @@ class BaiduPanPlugin(Star):
             CLOUD_SAVE_DIR = cloud_dir.rstrip("/")
         else:
             CLOUD_SAVE_DIR = "/我的资源/AutoTransfer"
-        logger.info(f"[BaiduPan] cloud save dir: {CLOUD_SAVE_DIR}")
+        logger.info(f"[baidu_netdisk] cloud save dir: {CLOUD_SAVE_DIR}")
 
         # 缓存：链接、密码、目录树、文件列表
         self._cached_surl = ""
@@ -1436,7 +1436,7 @@ class BaiduPanPlugin(Star):
         if _ensure_bpcs_exe():
             _run_bpcs(["config", "set", "-savedir", DOWNLOAD_DIR], timeout=15)
         else:
-            logger.warning(f"[BaiduPan] {_BPCS_EXE_NAME} 不可用，首次登录时会自动下载，配置将在下载后生效")
+            logger.warning(f"[baidu_netdisk] {_BPCS_EXE_NAME} 不可用，首次登录时会自动下载，配置将在下载后生效")
 
         # 解析黑名单
         bl = str(self.config.get("blacklist", "")).strip()
@@ -1447,23 +1447,23 @@ class BaiduPanPlugin(Star):
                 if uid:
                     self._blacklist.add(uid)
         if self._blacklist:
-            logger.info(f"[BaiduPan] blacklist: {self._blacklist}")
+            logger.info(f"[baidu_netdisk] blacklist: {self._blacklist}")
 
         # 读取下载后自动删除网盘文件开关
         global _auto_delete_cloud
         _auto_delete_cloud = bool(self.config.get("auto_delete_cloud", True))
-        logger.info(f"[BaiduPan] auto_delete_cloud: {_auto_delete_cloud}")
+        logger.info(f"[baidu_netdisk] auto_delete_cloud: {_auto_delete_cloud}")
 
         # 进度显示配置
         self._progress_enabled = bool(self.config.get("progress_enabled", False))
         self._progress_interval = int(self.config.get("progress_interval", 30))
         if self._progress_enabled:
-            logger.info(f"[BaiduPan] progress reporting enabled, interval={self._progress_interval}s")
+            logger.info(f"[baidu_netdisk] progress reporting enabled, interval={self._progress_interval}s")
 
         # 下载超时（秒），-1 = 不超时
         global DOWNLOAD_TIMEOUT_SECONDS
         DOWNLOAD_TIMEOUT_SECONDS = int(self.config.get("timeout_seconds", -1))
-        logger.info(f"[BaiduPan] download timeout: {DOWNLOAD_TIMEOUT_SECONDS}s")
+        logger.info(f"[baidu_netdisk] download timeout: {DOWNLOAD_TIMEOUT_SECONDS}s")
 
         # 读取每天定时清理本地文件的小时数
         global _local_cleanup_hour
@@ -1482,9 +1482,9 @@ class BaiduPanPlugin(Star):
         time.sleep(2)  # 等待 _init_bpcs 先跑完
         result = login_bduss_bpcs(bduss, "")
         if "error" in result:
-            logger.warning(f"[BaiduPan] bduuss 配置自动登录失败: {result['error']}")
+            logger.warning(f"[baidu_netdisk] bduuss 配置自动登录失败: {result['error']}")
         else:
-            logger.info("[BaiduPan] bduuss 配置自动登录成功")
+            logger.info("[baidu_netdisk] bduuss 配置自动登录成功")
 
     def _transfer_and_list(self, surl: str, pwd: str) -> dict:
         """线程安全的"切换分享链接"：API 直连列出分享目录树并更新缓存。
@@ -1603,18 +1603,18 @@ class BaiduPanPlugin(Star):
         file_size = dl["size"]
         size_mb = file_size / (1024 * 1024)
         name = dl["name"]
-        logger.info(f"[BaiduPan] _send_file: name={name}, size={size_mb:.1f}MB, share_url={share_url[:50] if share_url else 'None'}")
+        logger.info(f"[baidu_netdisk] _send_file: name={name}, size={size_mb:.1f}MB, share_url={share_url[:50] if share_url else 'None'}")
 
         # 自动检测平台，优先于配置
         platform = getattr(event.platform_meta, "name", "") if event.platform_meta else ""
         platform_id = getattr(event, "platform_identifier", "") or ""
-        logger.info(f"[BaiduPan] _send_file: platform={platform}, platform_id={platform_id}")
+        logger.info(f"[baidu_netdisk] _send_file: platform={platform}, platform_id={platform_id}")
         if platform == "qq_official" or "qq_official" in platform_id or "qq_official" in platform:
-            logger.info(f"[BaiduPan] _send_file: detected qq_official, using _send_official")
+            logger.info(f"[baidu_netdisk] _send_file: detected qq_official, using _send_official")
             return await self._send_official(event, file_path, name, size_mb, share_url)
 
         send_mode = self._get_send_mode()
-        logger.info(f"[BaiduPan] _send_file: send_mode={send_mode}")
+        logger.info(f"[baidu_netdisk] _send_file: send_mode={send_mode}")
         if send_mode == "official":
             return await self._send_official(event, file_path, name, size_mb, share_url)
         elif send_mode == "other":
@@ -1624,13 +1624,13 @@ class BaiduPanPlugin(Star):
 
     async def _send_onebot(self, event: AstrMessageEvent, file_path: str, name: str, size_mb: float, share_url: str = "") -> bool:
         """OneBot / napcat 路径：直接发送文件，失败则发送链接"""
-        logger.info(f"[BaiduPan] _send_onebot: name={name}, size={size_mb:.1f}MB")
+        logger.info(f"[baidu_netdisk] _send_onebot: name={name}, size={size_mb:.1f}MB")
         try:
             await event.send(MessageChain(chain=[File(name=name, file=file_path)]))
-            logger.info(f"[BaiduPan] _send_onebot: direct send success")
+            logger.info(f"[baidu_netdisk] _send_onebot: direct send success")
             return True
         except Exception as e2:
-            logger.warning(f"[BaiduPan] _send_onebot: direct send failed: {e2}")
+            logger.warning(f"[baidu_netdisk] _send_onebot: direct send failed: {e2}")
             # 兜底：发送链接
             msg = f"⚠️ 文件 {size_mb:.1f}MB 发送失败"
             if share_url:
@@ -1647,7 +1647,7 @@ class BaiduPanPlugin(Star):
             await event.send(MessageChain(chain=[File(name=name, file=file_path)]))
             return True
         except Exception as e:
-            logger.warning(f"[BaiduPan] send file failed: {e}")
+            logger.warning(f"[baidu_netdisk] send file failed: {e}")
             msg = "⚠️ 文件发送失败"
             if share_url:
                 msg += f"，请自行下载: {share_url}"
@@ -1659,17 +1659,17 @@ class BaiduPanPlugin(Star):
 
     async def _send_official(self, event: AstrMessageEvent, file_path: str, name: str, size_mb: float, share_url: str = "") -> bool:
         """QQ官方机器人路径：<=200MB 走官方API上传，>200MB 只能返回链接"""
-        logger.info(f"[BaiduPan] _send_official: name={name}, size={size_mb:.1f}MB, limit={FLASH_TASK_LIMIT_MB}MB")
+        logger.info(f"[baidu_netdisk] _send_official: name={name}, size={size_mb:.1f}MB, limit={FLASH_TASK_LIMIT_MB}MB")
         if size_mb <= FLASH_TASK_LIMIT_MB:
-            logger.info(f"[BaiduPan] _send_official: file <= limit, sending directly")
+            logger.info(f"[baidu_netdisk] _send_official: file <= limit, sending directly")
             try:
                 await event.send(MessageChain(chain=[File(name=name, file=file_path)]))
                 return True
             except Exception as e:
-                logger.warning(f"[BaiduPan] _send_official: send failed: {e}")
+                logger.warning(f"[baidu_netdisk] _send_official: send failed: {e}")
                 return False
 
-        logger.info(f"[BaiduPan] _send_official: file > limit, returning link")
+        logger.info(f"[baidu_netdisk] _send_official: file > limit, returning link")
         msg = "⚠️ 文件超过200MB，QQ官方API暂不支持大文件上传"
         if share_url:
             msg += f"，请自行下载: {share_url}"
@@ -1726,7 +1726,7 @@ class BaiduPanPlugin(Star):
                     f"⚠️ 打包需约 {_format_size(str(total_bytes))} 临时空间，当前可用 {_format_size(str(free))}，空间不足未打包",
                     subject)
         except Exception as e:
-            logger.warning(f"[BaiduPan] _send_folder: 磁盘空间检查失败: {e}")
+            logger.warning(f"[baidu_netdisk] _send_folder: 磁盘空间检查失败: {e}")
 
         safe_name = re.sub(r'[\\/:*?"<>|]+', "_", folder_name).strip() or "folder"
         zip_name = f"{safe_name}.zip"
@@ -1734,7 +1734,7 @@ class BaiduPanPlugin(Star):
         z = await asyncio.to_thread(_zip_files, files, zip_path, folder_name)
         if "error" in z:
             return await self._folder_fallback(event, dl, f"⚠️ 打包失败（{z['error']}），未发送", subject)
-        logger.info(f"[BaiduPan] _send_folder: 打包完成 name={zip_name}, size={z['size']}, "
+        logger.info(f"[baidu_netdisk] _send_folder: 打包完成 name={zip_name}, size={z['size']}, "
                     f"stored={z.get('stored')}, deflated={z.get('deflated')}")
         # 磁盘上用带随机后缀的唯一名（避免同名文件夹并发打包互相覆盖），发给用户时用干净名
         z_send = dict(z, name=zip_name)
@@ -1829,7 +1829,7 @@ class BaiduPanPlugin(Star):
 
         dl_key = f"tool:pan_download_dir:{event.get_sender_id()}:{folder_path}"
         if dl_key in self._active_downloads:
-            logger.warning(f"[BaiduPan] pan_download_dir: duplicate blocked: {dl_key}")
+            logger.warning(f"[baidu_netdisk] pan_download_dir: duplicate blocked: {dl_key}")
             return "⏳ 该文件正在下载中，请稍候..."
         self._active_downloads.add(dl_key)
         try:
@@ -1908,7 +1908,7 @@ class BaiduPanPlugin(Star):
 
         dl_key = f"tool:pan_download_all:{event.get_sender_id()}"
         if dl_key in self._active_downloads:
-            logger.warning(f"[BaiduPan] pan_download_all: duplicate blocked: {dl_key}")
+            logger.warning(f"[baidu_netdisk] pan_download_all: duplicate blocked: {dl_key}")
             return "⏳ 该文件正在下载中，请稍候..."
         self._active_downloads.add(dl_key)
         try:
@@ -2175,8 +2175,8 @@ class BaiduPanPlugin(Star):
                     pass
                 # 从 session 的 cookie jar 提取全部 cookie（已含 pan 专用 cookie）
                 full_cookie = "; ".join(f"{k}={cv2}" for k, cv2 in sess.cookies.items())
-                logger.info(f"[BaiduPan] qrlogin cookie keys: {list(sess.cookies.keys())}")
-                logger.info(f"[BaiduPan] qrlogin full_cookie len: {len(full_cookie)}")
+                logger.info(f"[baidu_netdisk] qrlogin cookie keys: {list(sess.cookies.keys())}")
+                logger.info(f"[baidu_netdisk] qrlogin full_cookie len: {len(full_cookie)}")
                 bduss_m = re.search(r'BDUSS=([^\s;]+)', full_cookie)
                 if not bduss_m:
                     yield event.plain_result("❌ 未能提取 BDUSS，登录失败")
@@ -2327,13 +2327,13 @@ class BaiduPanPlugin(Star):
             dl_path = " ".join(parts[1:])
             # 下载锁检查
             if dl_key in self._active_downloads:
-                logger.warning(f"[BaiduPan] on_pan: duplicate download blocked: {dl_key}")
+                logger.warning(f"[baidu_netdisk] on_pan: duplicate download blocked: {dl_key}")
                 yield event.plain_result("⏳ 该文件正在下载中，请稍候...")
                 return
             self._active_downloads.add(dl_key)
             _lock_acquired = True
             try:
-                logger.info(f"[BaiduPan] on_pan down: dl_path={dl_path}, progress_enabled={self._progress_enabled}")
+                logger.info(f"[baidu_netdisk] on_pan down: dl_path={dl_path}, progress_enabled={self._progress_enabled}")
                 tr = await asyncio.to_thread(self._ensure_transferred_sync, dl_path)
                 if "error" in tr:
                     yield event.plain_result(f"❌ {tr['error']}")
@@ -2393,9 +2393,9 @@ class BaiduPanPlugin(Star):
                                         _last_prog_time = now
                         await self._interruptible_sleep(dl_future, self._progress_interval)
                 dl = await dl_future
-                logger.info(f"[BaiduPan] on_pan down: download complete, dl={dl}")
+                logger.info(f"[baidu_netdisk] on_pan down: download complete, dl={dl}")
                 if "error" in dl:
-                    logger.error(f"[BaiduPan] on_pan down: download error: {dl['error']}")
+                    logger.error(f"[baidu_netdisk] on_pan down: download error: {dl['error']}")
                     yield event.plain_result(f"❌ {dl['error']}")
                 else:
                     if dl.get("is_dir"):

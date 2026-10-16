@@ -94,7 +94,7 @@
 
 ### 安装
 
-- **方式一**：AstrBot WebUI 插件市场中搜索 `baidu_pan` 安装
+- **方式一**：AstrBot WebUI 插件市场中搜索 `baidu_netdisk` 安装
 - **方式二**：将本项目复制到 AstrBot 的 `addons/` 目录，重启 AstrBot
 
 ### 登录
