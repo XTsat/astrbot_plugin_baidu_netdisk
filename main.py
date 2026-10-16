@@ -1148,11 +1148,65 @@ def _user_bucket(user_id: str) -> str:
     return "u" + hashlib.blake2b(raw.encode("utf-8"), digest_size=6).hexdigest()
 
 
+def _snapshot_local_files(root: str) -> dict:
+    """记录目录下每个文件的 (大小, mtime)，用于判断哪些文件是本次下载产生的。"""
+    snap = {}
+    if not root or not os.path.isdir(root):
+        return snap
+    for cur, _, names in os.walk(root):
+        for n in names:
+            p = os.path.join(cur, n)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            snap[p] = (st.st_size, st.st_mtime_ns)
+    return snap
+
+
+def _collect_files_under(root: str) -> list:
+    """收集目录下所有文件为 {path, name, size}。"""
+    out = []
+    for cur, _, names in os.walk(root):
+        for n in names:
+            p = os.path.join(cur, n)
+            try:
+                size = os.path.getsize(p)
+            except OSError:
+                continue
+            out.append({"path": p, "name": n, "size": size})
+    return out
+
+
+def _collect_new_files(root: str, before: dict, bucket: str = "") -> list:
+    """收集 root 下相对 before 快照「新增或内容有变化」的文件，即本次下载产生的文件。
+    bucket 非空时优先只收该转存子目录下的文件：转存目录按用户隔离，
+    并发下载时不会把别人的下载结果算进本次清单。
+    不再有「收集全部文件」的兜底，避免把下载目录里的历史文件或他人文件发出去。"""
+    def _in_bucket(path: str) -> bool:
+        return not bucket or bucket in path.replace("\\", "/").split("/")
+
+    matched, others = [], []
+    for cur, _, names in os.walk(root):
+        target = matched if _in_bucket(cur) else others
+        for n in names:
+            p = os.path.join(cur, n)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if before.get(p) == (st.st_size, st.st_mtime_ns):
+                continue  # 下载前已存在且大小/时间未变，不是本次产生的
+            target.append({"path": p, "name": n, "size": st.st_size})
+    return matched or others
+
+
 def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue.Queue" = None,
-                        cloud_dir: str = "") -> dict:
+                        cloud_dir: str = "", bucket: str = "") -> dict:
     """从网盘下载指定路径的文件或文件夹（不转存，直接下载已有文件）。
 
     cloud_dir: 网盘目录，留空则用全局 CLOUD_SAVE_DIR（调用方通常传本用户的转存子目录）。
+    bucket: 本次任务在网盘目录中的隔离子目录名，用于把下载结果精确归属到本次任务。
     progress_queue: 可选，传入 queue.Queue 后，下载过程中会向队列放入进度信息。
     """
     cloud_dir = cloud_dir or CLOUD_SAVE_DIR or DEFAULT_CLOUD_SAVE_DIR
@@ -1198,10 +1252,13 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
         return {"error": f"文件过大 ({file_size//1024//1024}MB) 超过 {max_mb}MB 限制"}
 
     # 下载前先检查本地是否已有该文件（避免 BPCS 卡在重复下载）
+    # 注意先比「远程路径镜像」再比文件名：不同用户转存目录不同，
+    # 只按文件名比对会把别人下载的同名文件误判成本文件，导致返回错误内容
     if not is_dir:
         account_folder = _get_account_folder()
         check_paths = []
         if account_folder:
+            check_paths.append(os.path.join(DOWNLOAD_DIR, account_folder, full_path.strip("/")))
             check_paths.append(os.path.join(DOWNLOAD_DIR, account_folder, file_name))
         check_paths.append(os.path.join(DOWNLOAD_DIR, file_name))
         for p in check_paths:
@@ -1220,7 +1277,9 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
     # 如果 file_size 为0但文件非目录，把 0 也塞进去，让 handler 监控时用实际文件大小
     if progress_queue is not None and not is_dir:
         progress_queue.put(("_info", file_name, file_size))
-    started_at = time.time()
+    # 文件夹下载前先记录本地已有文件，下载完成后据此精确归属「本次产生」的文件
+    before_files = _snapshot_local_files(DOWNLOAD_DIR) if is_dir else {}
+    dl_started_at = time.time()
     try:
         proc = subprocess.Popen(
             [BPCS_PATH, "download", full_path, "--ow"],
@@ -1268,38 +1327,29 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
         return {"error": "下载目录未设置"}
 
     logger.info(f"[baidu_netdisk] download_from_cloud: searching for downloaded file, DOWNLOAD_DIR={DOWNLOAD_DIR}")
+    account_folder = _get_account_folder()
     if is_dir:
+        # 优先按「远程路径镜像」定位本地目录（BPCS 会把网盘路径建在 savedir/<账号>/ 下），
+        # 目录不存在时退回「下载前后快照差异」；两者都不命中就报错，
+        # 不再退回「收集下载目录全部文件」（那会把历史文件与他人的文件一起发出去）
         downloaded = []
-
-        def _collect(only_recent: bool):
-            found_files = []
-            for root, _, files in os.walk(DOWNLOAD_DIR):
-                for f in files:
-                    fp = os.path.join(root, f)
-                    if only_recent:
-                        try:
-                            if os.path.getctime(fp) < started_at - 120:
-                                continue  # 只收本次下载窗口内新建的文件
-                        except OSError:
-                            continue
-                    found_files.append({"path": fp, "name": f, "size": os.path.getsize(fp)})
-            return found_files
-
-        downloaded = _collect(only_recent=True)
+        mirror_dir = (os.path.join(DOWNLOAD_DIR, account_folder, full_path.strip("/"))
+                      if account_folder else "")
+        if mirror_dir and os.path.isdir(mirror_dir):
+            downloaded = _collect_files_under(mirror_dir)
         if not downloaded:
-            # 兜底：时间过滤没匹配到时退回收集全部
-            downloaded = _collect(only_recent=False)
+            downloaded = _collect_new_files(DOWNLOAD_DIR, before_files, bucket)
         if not downloaded:
-            return {"error": "文件夹下载完成但未找到文件"}
+            return {"error": "文件夹下载完成但未找到本次下载的文件"}
         _manifest_add([d["path"] for d in downloaded])
         if _auto_delete_cloud:
             _run_bpcs(["rm", full_path], timeout=30)
         return {"path": DOWNLOAD_DIR, "name": file_name, "size": 0, "is_dir": True, "files": downloaded}
     else:
-        # 先找账号专属文件夹（BPCS 会按 uid_用户名 创建子目录）
-        account_folder = _get_account_folder()
+        # 先找账号专属文件夹（BPCS 会按 uid_用户名 创建子目录），并优先按远程路径镜像定位
         search_dirs = []
         if account_folder:
+            search_dirs.append(os.path.join(DOWNLOAD_DIR, account_folder, full_path.strip("/")))
             search_dirs.append(os.path.join(DOWNLOAD_DIR, account_folder, file_name))
         search_dirs.append(os.path.join(DOWNLOAD_DIR, file_name))
         local_path = None
@@ -1307,11 +1357,31 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
             if os.path.exists(p):
                 local_path = p
                 break
-        if not local_path:
+        if not local_path and bucket:
+            # 兜底一：同名文件只认本次任务转存子目录里的那个
             for root, _, files in os.walk(DOWNLOAD_DIR):
-                if file_name in files:
+                if bucket in root.replace("\\", "/").split("/") and file_name in files:
                     local_path = os.path.join(root, file_name)
                     break
+        if not local_path:
+            # 兜底二：目录结构与预期不符时，只认本次下载开始之后新出现的同名文件。
+            # 单纯按文件名找会把别人下载的同名文件发出去，所以用创建/修改时间卡住下载起点；
+            # 宁可报「未找到文件」，也不把不确定归属的文件发出去
+            newest = None
+            for root, _, files in os.walk(DOWNLOAD_DIR):
+                if file_name not in files:
+                    continue
+                p = os.path.join(root, file_name)
+                try:
+                    fresh = max(os.path.getctime(p), os.path.getmtime(p))
+                except OSError:
+                    continue
+                if fresh < dl_started_at:
+                    continue
+                if newest is None or fresh > newest[0]:
+                    newest = (fresh, p)
+            if newest:
+                local_path = newest[1]
         if not local_path or not os.path.exists(local_path):
             return {"error": "下载完成但未找到文件"}
         _manifest_add([local_path])
@@ -1871,7 +1941,7 @@ class BaiduNetdiskPlugin(Star):
             prog_q = queue.Queue() if self._progress_enabled else None
             dl_future = asyncio.create_task(asyncio.to_thread(
                 download_from_cloud, tr["name"], self._get_max_mb(), prog_q,
-                self._cloud_dir_for(uid)))
+                self._cloud_dir_for(uid), _user_bucket(uid)))
             if prog_q:
                 file_info = None
                 while not dl_future.done():
@@ -1954,7 +2024,7 @@ class BaiduNetdiskPlugin(Star):
             prog_q = queue.Queue() if self._progress_enabled else None
             dl_future = asyncio.create_task(asyncio.to_thread(
                 download_from_cloud, "", self._get_max_mb(), prog_q,
-                self._cloud_dir_for(uid)))
+                self._cloud_dir_for(uid), _user_bucket(uid)))
             if prog_q:
                 while not dl_future.done():
                     try:
@@ -2381,7 +2451,7 @@ class BaiduNetdiskPlugin(Star):
                 prog_q = queue.Queue() if self._progress_enabled else None
                 dl_future = asyncio.create_task(asyncio.to_thread(
                     download_from_cloud, tr["name"], self._get_max_mb(), prog_q,
-                    self._cloud_dir_for(uid)))
+                    self._cloud_dir_for(uid), _user_bucket(uid)))
                 if prog_q:
                     file_info = None
                     _last_prog_size = None
