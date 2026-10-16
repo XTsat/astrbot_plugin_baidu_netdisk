@@ -40,7 +40,7 @@
 | `/pan login 3 <BDUSS> [STOKEN]` 或 `bduss ...` | 全部 | BDUSS 登录 |
 | `/pan login 4 <完整Cookie字符串>` 或 `cookies ...` | 全部 | Cookie 登录 |
 | `/pan login 0` 或 `out` | 全部 | 退出登录 |
-| `/pan pcs` | 管理员 | 下载或重新下载 BaiduPCS-Go 工具（文件损坏时也可修复；直连 GitHub 失败时自动挑选可用加速镜像，已保存代理则只走代理） |
+| `/pan pcs` | 管理员 | 下载或重新下载 BaiduPCS-Go 工具（文件损坏时也可修复；直连 GitHub 失败时自动挑选可用加速镜像，已保存代理则资产只走该代理，release 信息仍优先直连 GitHub 官方 API） |
 | `/pan pcs git` | 管理员 | 强制直连 GitHub 官方 release 下载（不用代理、也不用加速镜像） |
 | `/pan pcs <加速镜像地址>` | 管理员 | 指定加速镜像下载并保存（如 `https://gh-proxy.org/`），后续登录时自动下载也生效 |
 | `/pan pcs off` | 管理员 | 清除已保存的加速镜像，回到自动挑选镜像的下载方式 |
@@ -113,11 +113,13 @@
 
 插件**不内置** BaiduPCS-Go（Windows 下为 `BaiduPCS-Go.exe`，Linux/macOS 下为无扩展名的 `BaiduPCS-Go`）。**无需手动下载**：首次执行登录类命令（扫码、账密、BDUSS、Cookie，或配置 `bduuss` 启动自动登录）时会自动下载 GitHub 官方**最新 release** 中当前平台对应的二进制（Windows / Linux / macOS，x64 / arm64 自动匹配）。GitHub 直连不通时会**自动逐个探测常用的 GitHub 加速镜像**（`gh-proxy.com`、`ghfast.top` 等），用其中可用的那个完成下载，Windows / Linux / macOS 全平台都适用；探测成功的镜像在本次运行内会优先复用。上述自动下载无需用户干预，**下载来源也不可被普通用户更改**。`/pan pcs` 系列会下载并替换机器人本地运行的程序，属管理操作，因此**仅管理员可用**：管理员可用它手动下载/更新/修复工具，也可指定镜像 `/pan pcs https://gh-proxy.org/`（地址自动保存，之后登录时自动下载也走它；`/pan pcs off` 清除后回到自动挑选），只走 GitHub 原始链接时用 `/pan pcs git`。为防下载被指向任意服务器，可填的镜像**只限已知的加速源**；使用自建镜像的管理员可用环境变量 `BAIDU_NETDISK_EXTRA_PROXIES` 追加允许的域名（英文逗号分隔，添加后也会进入自动探测候选）。
 
+下载的压缩包会与 GitHub 官方给出的 **sha256** 核对，不一致就丢弃并换下一个来源；**走加速镜像（或管理员指定的代理）时必须能核对官方 sha256，核对不了就不用该来源**。release 信息（含官方 sha256）始终优先直连 GitHub 官方 API，只有直连不通才退回到加速源获取——此时校验信息与压缩包来自同一第三方，插件会在日志和下载结果里明确提示「本次无法抵御该来源替换文件」。
+
 ### 安全声明
 
 - **不收集、不存储、不传输任何账号密码**，源码完全开源可审计
 - 主推扫码登录：密码根本不经过插件、机器人或任何第三方，登录凭证只保存在你自己的本机
-- BaiduPCS-Go 是第三方开源工具（[qjfoidnh/BaiduPCS-Go](https://github.com/qjfoidnh/BaiduPCS-Go)），本插件不打包任何二进制文件，二进制从 GitHub 官方最新 release 按平台下载，下载后校验文件格式（Windows: PE；Linux: ELF；macOS: Mach-O）
+- BaiduPCS-Go 是第三方开源工具（[qjfoidnh/BaiduPCS-Go](https://github.com/qjfoidnh/BaiduPCS-Go)），本插件不打包任何二进制文件，二进制从 GitHub 官方最新 release 按平台下载，下载时校验官方 sha256（校验不过就换源或拒绝），下载后还会校验文件格式（Windows: PE；Linux: ELF；macOS: Mach-O）
 
 ### 注意事项
 

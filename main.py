@@ -452,10 +452,29 @@ def _probe_mirror(url: str, timeout: int = 10) -> bool:
     return head[:2] in (b"PK", b"MZ")
 
 
+def _extract_sha256(asset: dict) -> str:
+    """取出 release 资产里的官方 sha256（GitHub 的 digest 字段形如 sha256:<hex>）。
+    取不到或格式不认识时返回空串。
+
+    注意：这是**上传的压缩包**的哈希，不是解压后可执行文件的哈希。"""
+    raw = str(asset.get("digest") or "").strip().lower()
+    if raw.startswith("sha256:"):
+        raw = raw[len("sha256:"):]
+    if len(raw) == 64 and all(c in "0123456789abcdef" for c in raw):
+        return raw
+    if raw:
+        logger.warning(f"[baidu_netdisk] ⚠️ 无法识别的资产摘要格式，已忽略: {raw[:40]}")
+    return ""
+
+
 def _download_asset(via: str, asset_url: str, tag: str, suffix: str,
-                    expected_size: int, max_attempts: int) -> str:
+                    expected_size: int, max_attempts: int,
+                    expected_digest: str = "", require_digest: bool = False) -> str:
     """下载 release 资产、解压出当前平台的可执行文件并写入本地（via 为空表示直连 GitHub）。
-    成功返回空串，失败返回错误描述。"""
+    成功返回空串，失败返回错误描述。
+
+    expected_digest 非空时必须与官方 sha256 一致（比对的是压缩包整包，在解压之前）；
+    require_digest=True 时缺少摘要直接拒绝——第三方来源拿不到官方完整性背书就不该采信。"""
     import zipfile as _zip, io as _io
 
     def _get(url: str, timeout: int = 300) -> bytes | None:
@@ -491,6 +510,18 @@ def _download_asset(via: str, asset_url: str, tag: str, suffix: str,
             continue
         if len(data) != expected_size:
             last_err = f"下载大小不匹配: 官方API={expected_size}, 实际={len(data)}"
+            continue
+        # 官方 digest 是「上传的 zip」的 sha256：在解压前校验整包，包内所有文件内容随之被认定
+        if expected_digest:
+            actual_digest = hashlib.sha256(data).hexdigest()
+            if actual_digest != expected_digest:
+                last_err = (f"压缩包 sha256 校验失败（官方 {expected_digest[:12]}…，"
+                            f"实际 {actual_digest[:12]}…）")
+                logger.warning(f"[baidu_netdisk] ⚠️ {where}的压缩包与官方摘要不一致，已丢弃：{last_err}")
+                continue
+        elif require_digest:
+            last_err = "官方未提供 sha256，第三方来源的压缩包无法校验"
+            logger.warning(f"[baidu_netdisk] ⚠️ {where}缺少可核对的官方 sha256，按安全策略跳过该来源")
             continue
         try:
             with _zip.ZipFile(_io.BytesIO(data)) as zf:
@@ -536,7 +567,10 @@ def _download_github_exe(proxy: str | None = None, max_attempts: int = 3,
     国内网络下 GitHub 下载经常瞬时失败（超时/连接重置/403），对可重试的失败自动重试，最多 max_attempts 次。
     指定 proxy（或存在已保存的代理）时只走该加速源；未配置代理时先直连 GitHub，直连失败后
     依次探测候选加速镜像（见 _GITHUB_MIRROR_HOSTS）并改用可用的那个，各平台通用。
-    返回 {"ok": True, "via": 镜像} 或 {"error": "..."}；allow_mirrors=False 表示强制直连不走镜像。"""
+    release 信息（含官方 sha256）始终优先直连 api.github.com，只有直连不通才退到代理/镜像；
+    压缩包与官方 sha256 不一致时丢弃并换下一个来源，第三方来源缺少 sha256 时直接跳过。
+    返回 {"ok": True, "via": 镜像, "digest_verified": bool, "info_trusted": bool, "info_source": str}
+    或 {"error": "..."}；allow_mirrors=False 表示强制直连不走镜像。"""
     global _auto_mirror
 
     if proxy is None:
@@ -551,15 +585,30 @@ def _download_github_exe(proxy: str | None = None, max_attempts: int = 3,
     if not suffix:
         return {"error": f"当前平台（{sys.platform}/{platform.machine()}）暂不支持自动下载 BaiduPCS-Go，请手动获取对应平台的二进制"}
 
-    info = _fetch_release_info(proxy)
-    direct_api_ok = bool(info)
-    if not info and mirrors:
-        # 直连 API 不通时让能代理 api.github.com 的镜像提供 release 信息（资产仍优先直连）
-        for mirror in mirrors:
-            info = _fetch_release_info(mirror, timeout=10)
-            if info:
-                logger.info(f"[baidu_netdisk] GitHub API 直连不可用，改用加速镜像 {mirror} 获取 release 信息")
-                break
+    info = None
+    info_trusted = False
+    info_source = ""
+    # release 信息（含官方 sha256 摘要）优先直连 api.github.com：摘要只在可信来源手里才有意义，
+    # 走代理/镜像拿到的摘要与它提供的载荷同源，无法抵御该来源替换压缩包
+    info_sources = [("", True)]
+    if proxy:
+        info_sources.append((proxy, False))
+    else:
+        info_sources += [(m, False) for m in mirrors]
+    for src, trustworthy in info_sources:
+        if src:
+            info = _fetch_release_info(src, timeout=10)
+        else:
+            # 有后备来源时直连只等 15 秒：被墙时没必要让用户干等 30 秒
+            info = _fetch_release_info("", timeout=15 if len(info_sources) > 1 else 30)
+        if info:
+            info_trusted, info_source = trustworthy, src
+            if trustworthy:
+                logger.info("[baidu_netdisk] 已从 GitHub 官方 API 获取 release 信息（含官方 sha256）")
+            else:
+                logger.warning(f"[baidu_netdisk] ⚠️ GitHub 官方 API 不可用，release 信息（含 sha256）改由 "
+                               f"{src} 提供；该来源可同时替换校验信息与压缩包，本次下载无法抵御它")
+            break
     if not info:
         return {"error": "GitHub 官方 release 获取失败，请检查网络后重试"}
     tag = info.get("tag_name", "latest")
@@ -573,9 +622,10 @@ def _download_github_exe(proxy: str | None = None, max_attempts: int = 3,
     if not asset:
         names = [a.get("name", "") for a in info.get("assets", [])]
         return {"error": f"未在 release {tag} 中找到 {suffix} 的 zip 资产（现有: {names or '无'}）"}
+    digest = _extract_sha256(asset)
 
     # API 都是靠镜像拿到的，说明直连基本不通，直连下载只试一次即可，省得白等重试
-    routes = [(proxy, max_attempts if direct_api_ok else 1, False)]
+    routes = [(proxy, max_attempts if info_trusted else 1, False)]
     routes += [(m, 1, True) for m in mirrors]
     errors = []
     for via, attempts, need_probe in routes:
@@ -586,16 +636,31 @@ def _download_github_exe(proxy: str | None = None, max_attempts: int = 3,
                 errors.append(f"{via}: 不可用")
                 continue
             logger.info(f"[baidu_netdisk] 直连下载失败，改用加速镜像 {via}")
-        err = _download_asset(via, asset["browser_download_url"], tag, suffix, asset["size"], attempts)
+        # 第三方来源必须能被官方摘要核对（require_digest），否则宁可不下载
+        err = _download_asset(via, asset["browser_download_url"], tag, suffix, asset["size"], attempts,
+                              expected_digest=digest, require_digest=bool(via))
         if not err:
             if need_probe:
                 _auto_mirror = via  # 记住可用镜像，本次运行后续下载优先复用
-            return {"ok": True, "via": via}
+            if digest:
+                logger.info(f"[baidu_netdisk] 压缩包 sha256 已与 GitHub 官方信息核对一致（{digest[:12]}…）")
+            return {"ok": True, "via": via, "digest_verified": bool(digest),
+                    "info_trusted": info_trusted, "info_source": info_source}
         errors.append(f"{'直连' if not via else via}: {err}")
     # 直连错误最有诊断价值，始终保留；镜像错误只留最后两条，避免报错糊成一团
     if len(errors) > 3:
         errors = errors[:1] + errors[-2:]
     return {"error": "；".join(errors)}
+
+
+def _digest_note(result: dict) -> str:
+    """把本次下载的完整性校验情况翻译成一句用户可读的说明。"""
+    if result.get("digest_verified"):
+        return "\n🔒 压缩包 sha256 已与 GitHub 官方信息核对一致"
+    if result.get("info_trusted"):
+        return "\n⚠️ GitHub 未提供 sha256，本次未校验压缩包（来源为 GitHub 官方直连）"
+    return (f"\n⚠️ 本次校验信息由 {result.get('info_source') or '第三方来源'} 提供，"
+            f"无法抵御该来源替换文件")
 
 
 def _run_bpcs(args: list, timeout: int = 300) -> tuple:
@@ -2613,7 +2678,10 @@ class BaiduNetdiskPlugin(Star):
                     yield event.plain_result("⏳ 正在从 GitHub 官方 release 直连下载最新版 BaiduPCS-Go...")
                     result = await asyncio.to_thread(_download_github_exe, "", 3, False)
                     if "ok" in result:
-                        yield event.plain_result(f"✅ {_BPCS_EXE_NAME} 下载成功！现在可以使用 /pan login 等命令了。")
+                        yield event.plain_result(
+                            f"✅ {_BPCS_EXE_NAME} 下载成功！现在可以使用 /pan login 等命令了。"
+                            + _digest_note(result)
+                        )
                     else:
                         yield event.plain_result(
                             f"❌ 下载失败: {result.get('error', '未知错误')}\n"
@@ -2648,7 +2716,10 @@ class BaiduNetdiskPlugin(Star):
             if "ok" in result:
                 used = f"（via 加速镜像 {result['via']}）" if result.get("via") else ""
                 saved = " 加速代理已保存，登录时自动下载也会使用。" if _github_proxy else ""
-                yield event.plain_result(f"✅ {_BPCS_EXE_NAME} 下载成功{used}！现在可以使用 /pan login 等命令了。{saved}")
+                yield event.plain_result(
+                    f"✅ {_BPCS_EXE_NAME} 下载成功{used}！现在可以使用 /pan login 等命令了。{saved}"
+                    + _digest_note(result)
+                )
             else:
                 yield event.plain_result(f"❌ 下载失败: {result.get('error', '未知错误')}")
             return
