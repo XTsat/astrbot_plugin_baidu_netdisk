@@ -17,7 +17,7 @@
 - **全平台可用**：Windows、Linux、macOS 均可部署，x64 / arm64 自动匹配
 - **目录查看与按需下载**：查看分享目录树，按需下载文件夹或单个文件
 - **文件夹自动发送**：QQ 等平台不能直接发送文件夹，插件会自动处理
-- **LLM 工具**：`pan_list` / `pan_transfer` / `pan_download_dir` / `pan_download_all`，AI 自动识别网盘链接并执行查看/转存/下载
+- **LLM 工具**：`pan_list` / `pan_transfer` / `pan_download_dir` / `pan_download_all`，AI 自动识别网盘链接并执行查看/转存/下载；下载类工具先受理再后台执行，完成后自动把文件发到当前会话
 - **大小与超时控制**：可配置最大下载大小与下载超时
 - **多平台适配**：napcat / SnowLuma（OneBot）、QQ 官方机器人、其他平台三种发送模式，大文件自动闪传
 - **自动清理**：下载完成后自动删除网盘转存文件；可配置定时清理本地下载文件
@@ -34,19 +34,19 @@
 | `/pan <链接或surl> [提取码]` | 全部 | 查看分享目录树（并缓存链接）；支持直接粘贴整段分享文案，自动识别链接与提取码 |
 | `/pan look` | 全部 | 重新查看最近一次的目录树 |
 | `/pan down <路径>` | 全部 | 下载文件夹或单个文件（自动识别类型）；文件夹不超过阈值时逐个发送，更多则打包 zip 发送 |
-| `/pan login` | 全部 | 登录/退出统一入口，发送后显示完整登录菜单 |
-| `/pan login 1` 或 `qr` | 全部 | 扫码登录（推荐） |
-| `/pan login 2 <账号> <密码>` 或 `pwd ...` | 全部 | 账密登录（建议私聊使用） |
-| `/pan login 3 <BDUSS> [STOKEN]` 或 `bduss ...` | 全部 | BDUSS 登录 |
-| `/pan login 4 <完整Cookie字符串>` 或 `cookies ...` | 全部 | Cookie 登录 |
-| `/pan login 0` 或 `out` | 全部 | 退出登录 |
+| `/pan login` | 管理员 | 登录/退出统一入口，发送后显示完整登录菜单 |
+| `/pan login 1` 或 `qr` | 管理员 | 扫码登录（推荐） |
+| `/pan login 2 <账号> <密码>` 或 `pwd ...` | 管理员 | 账密登录（建议私聊使用） |
+| `/pan login 3 <BDUSS> [STOKEN]` 或 `bduss ...` | 管理员 | BDUSS 登录 |
+| `/pan login 4 <完整Cookie字符串>` 或 `cookies ...` | 管理员 | Cookie 登录 |
+| `/pan login 0` 或 `out` | 管理员 | 退出登录 |
 | `/pan pcs` | 管理员 | 下载或重新下载 BaiduPCS-Go 工具（文件损坏时也可修复；直连 GitHub 失败时自动挑选可用加速镜像，已保存代理则资产只走该代理，release 信息仍优先直连 GitHub 官方 API） |
 | `/pan pcs git` | 管理员 | 强制直连 GitHub 官方 release 下载（不用代理、也不用加速镜像） |
 | `/pan pcs <加速镜像地址>` | 管理员 | 指定加速镜像下载并保存（只接受 `https://` 地址，如 `https://gh-proxy.org/`），后续登录时自动下载也生效 |
 | `/pan pcs off` | 管理员 | 清除已保存的加速镜像，回到自动挑选镜像的下载方式 |
 | `/pan help` | 全部 | 查看帮助 |
 
-> 💡 `/pan pcs` 系列会下载并替换机器人本地运行的程序，也能改写下载来源，因此**仅管理员可用**。普通用户无需手动操作：工具缺失时首次执行登录类命令（如 `/pan login 1`）会自动下载，下载来源由插件固定（已保存的加速镜像或自动探测的可用镜像），用户无法更改。
+> 💡 `/pan login` 系列与 `/pan pcs` 系列**仅管理员可用**：前者会改变全群共用的那一个百度账号（注销当前账号、或换成另一个账号，都会影响所有人），后者会下载并替换机器人本地运行的程序、也能改写下载来源。普通用户无需手动操作：工具缺失时管理员执行登录命令（如 `/pan login 1`）会自动下载，下载来源由插件固定（已保存的加速镜像或自动探测的可用镜像），用户无法更改。
 
 **使用示例**：
 
@@ -103,6 +103,7 @@
 
 ### 登录
 
+- 以下登录/退出命令**仅管理员可用**（账号为全群共用，普通用户只需要用 `/pan`、`/pan down` 下载）
 - **扫码登录（推荐）**：发送 `/pan login 1`（或 `/pan login qr`），用百度网盘 APP 扫码确认，全程无需输入账号密码；二维码 3 分钟有效，登录状态重启 AstrBot 后仍然有效
 - **账密登录**：`/pan login 2 <账号> <密码>`（或 `/pan login pwd <账号> <密码>`），建议私聊执行并用后撤回消息；百度风控可能返回 50052，此时改用扫码或 BDUSS
 - **BDUSS 登录**：浏览器 F12 → Application → Cookies 复制 BDUSS（和 STOKEN）后发送 `/pan login 3 <BDUSS> [STOKEN]`（或 `/pan login bduss <BDUSS> [STOKEN]`）
@@ -112,7 +113,7 @@
 
 ### BaiduPCS-Go
 
-插件**不内置** BaiduPCS-Go（Windows 下为 `BaiduPCS-Go.exe`，Linux/macOS 下为无扩展名的 `BaiduPCS-Go`）。**无需手动下载**：首次执行登录类命令（扫码、账密、BDUSS、Cookie，或配置 `bduuss` 启动自动登录）时会自动下载 GitHub 官方**最新 release** 中当前平台对应的二进制（Windows / Linux / macOS，x64 / arm64 自动匹配）。GitHub 直连不通时会**自动逐个探测常用的 GitHub 加速镜像**（`gh-proxy.com`、`ghfast.top` 等），用其中可用的那个完成下载，Windows / Linux / macOS 全平台都适用；探测成功的镜像在本次运行内会优先复用。上述自动下载无需用户干预，**下载来源也不可被普通用户更改**。
+插件**不内置** BaiduPCS-Go（Windows 下为 `BaiduPCS-Go.exe`，Linux/macOS 下为无扩展名的 `BaiduPCS-Go`）。**无需手动下载**：管理员首次执行登录类命令（扫码、账密、BDUSS、Cookie，或配置 `bduuss` 启动自动登录）时会自动下载 GitHub 官方**最新 release** 中当前平台对应的二进制（Windows / Linux / macOS，x64 / arm64 自动匹配）。GitHub 直连不通时会**自动逐个探测常用的 GitHub 加速镜像**（`gh-proxy.com`、`ghfast.top` 等），用其中可用的那个完成下载，Windows / Linux / macOS 全平台都适用；探测成功的镜像在本次运行内会优先复用。上述自动下载无需用户干预，**下载来源也不可被普通用户更改**。
 
 下载的压缩包会与 GitHub 官方给出的 **sha256** 核对，不一致就丢弃并换下一个来源；**走加速镜像（或管理员指定的代理）时必须能核对官方 sha256，核对不了就不用该来源**。release 信息（含官方 sha256）始终优先直连 GitHub 官方 API，只有直连不通才退回到加速源获取——此时校验信息与压缩包来自同一第三方，插件会在日志和下载结果里明确提示「本次无法抵御该来源替换文件」。下载过程中不校验证书的降级重试已默认关闭，证书校验失败会直接报错换源。
 
