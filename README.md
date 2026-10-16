@@ -40,11 +40,13 @@
 | `/pan login 3 <BDUSS> [STOKEN]` 或 `bduss ...` | 全部 | BDUSS 登录 |
 | `/pan login 4 <完整Cookie字符串>` 或 `cookies ...` | 全部 | Cookie 登录 |
 | `/pan login 0` 或 `out` | 全部 | 退出登录 |
-| `/pan pcs` | 全部 | 下载或重新下载 BaiduPCS-Go 工具（文件损坏时也可修复；直连 GitHub 失败时自动挑选可用加速镜像，已保存代理则只走代理） |
-| `/pan pcs git` | 全部 | 强制直连 GitHub 官方 release 下载（不用代理、也不用加速镜像） |
-| `/pan pcs <加速镜像地址>` | 全部 | 指定加速镜像下载并保存（如 `https://gh-proxy.org/`），后续登录时自动下载也生效 |
-| `/pan pcs off` | 全部 | 清除已保存的加速镜像，回到自动挑选镜像的下载方式 |
+| `/pan pcs` | 管理员 | 下载或重新下载 BaiduPCS-Go 工具（文件损坏时也可修复；直连 GitHub 失败时自动挑选可用加速镜像，已保存代理则只走代理） |
+| `/pan pcs git` | 管理员 | 强制直连 GitHub 官方 release 下载（不用代理、也不用加速镜像） |
+| `/pan pcs <加速镜像地址>` | 管理员 | 指定加速镜像下载并保存（如 `https://gh-proxy.org/`），后续登录时自动下载也生效 |
+| `/pan pcs off` | 管理员 | 清除已保存的加速镜像，回到自动挑选镜像的下载方式 |
 | `/pan help` | 全部 | 查看帮助 |
+
+> 💡 `/pan pcs` 系列会下载并替换机器人本地运行的程序，也能改写下载来源，因此**仅管理员可用**。普通用户无需手动操作：工具缺失时首次执行登录类命令（如 `/pan login 1`）会自动下载，下载来源由插件固定（已保存的加速镜像或自动探测的可用镜像），用户无法更改。
 
 **使用示例**：
 
@@ -109,7 +111,7 @@
 
 ### BaiduPCS-Go
 
-插件**不内置** BaiduPCS-Go（Windows 下为 `BaiduPCS-Go.exe`，Linux/macOS 下为无扩展名的 `BaiduPCS-Go`）。**无需手动下载**：首次执行登录类命令（扫码、账密、BDUSS、Cookie，或配置 `bduuss` 启动自动登录）时会自动下载 GitHub 官方**最新 release** 中当前平台对应的二进制（Windows / Linux / macOS，x64 / arm64 自动匹配）。也可手动用 `/pan pcs` 下载/更新，文件损坏用同一命令修复。GitHub 直连不通时会**自动逐个探测常用的 GitHub 加速镜像**（`gh-proxy.com`、`ghfast.top` 等），用其中可用的那个完成下载，Windows / Linux / macOS 全平台都适用；探测成功的镜像在本次运行内会优先复用。也可手动指定镜像：`/pan pcs https://gh-proxy.org/`（地址自动保存，之后登录时自动下载也走它；`/pan pcs off` 清除后回到自动挑选）；只走 GitHub 原始链接时用 `/pan pcs git`。为防下载被指向任意服务器，可填的镜像**只限已知的加速源**；使用自建镜像的管理员可用环境变量 `BAIDU_NETDISK_EXTRA_PROXIES` 追加允许的域名（英文逗号分隔，添加后也会进入自动探测候选）。
+插件**不内置** BaiduPCS-Go（Windows 下为 `BaiduPCS-Go.exe`，Linux/macOS 下为无扩展名的 `BaiduPCS-Go`）。**无需手动下载**：首次执行登录类命令（扫码、账密、BDUSS、Cookie，或配置 `bduuss` 启动自动登录）时会自动下载 GitHub 官方**最新 release** 中当前平台对应的二进制（Windows / Linux / macOS，x64 / arm64 自动匹配）。GitHub 直连不通时会**自动逐个探测常用的 GitHub 加速镜像**（`gh-proxy.com`、`ghfast.top` 等），用其中可用的那个完成下载，Windows / Linux / macOS 全平台都适用；探测成功的镜像在本次运行内会优先复用。上述自动下载无需用户干预，**下载来源也不可被普通用户更改**。`/pan pcs` 系列会下载并替换机器人本地运行的程序，属管理操作，因此**仅管理员可用**：管理员可用它手动下载/更新/修复工具，也可指定镜像 `/pan pcs https://gh-proxy.org/`（地址自动保存，之后登录时自动下载也走它；`/pan pcs off` 清除后回到自动挑选），只走 GitHub 原始链接时用 `/pan pcs git`。为防下载被指向任意服务器，可填的镜像**只限已知的加速源**；使用自建镜像的管理员可用环境变量 `BAIDU_NETDISK_EXTRA_PROXIES` 追加允许的域名（英文逗号分隔，添加后也会进入自动探测候选）。
 
 ### 安全声明
 
@@ -122,6 +124,7 @@
 - 需登录百度网盘账号；会员账号可获得更高下载速度
 - 下载文件暂存于 `download_dir`（默认 AstrBot 插件数据目录下的 `downloads/`），用 `local_cleanup_hour` 定时清理（只清理本插件下载的文件）
 - 下载完成默认自动删除自己转存的网盘文件（回收站可找回），可关闭 `auto_delete_cloud`；转存目录按用户隔离，不会删到别人的文件
+- `/pan pcs`（工具下载/更新/修复、指定或清除加速镜像）**仅管理员可用**；普通用户无需操作，登录时工具会自动下载，下载来源由插件固定、不可更改
 - 文件超过 `max_file_size` 限制时返回原分享链接
 - 网盘剩余空间不足时整包下载/转存会失败并明确提示，可改用 `/pan down <路径>` 或让 LLM 分批挑选
 - 分享链接在百度侧失效（打开报 500 或「链接出错」）时插件会明确报错，需分享者重新分享
