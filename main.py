@@ -5,6 +5,7 @@ Download files from Baidu Netdisk share links using BaiduPCS-Go,
 then send via AstrBot's platform adapters.
 """
 import asyncio
+import hashlib
 import os
 import platform
 import queue
@@ -123,7 +124,8 @@ PLUGIN_DATA_DIR = _resolve_plugin_data_dir()
 
 
 DOWNLOAD_DIR = None  # 初始化时根据配置设置
-CLOUD_SAVE_DIR = None  # 网盘转存目录
+CLOUD_SAVE_DIR = None  # 网盘转存目录（各用户的实际转存目录是它的子目录，见 _cloud_dir_for）
+DEFAULT_CLOUD_SAVE_DIR = "/我的资源/AutoTransfer"
 FLASH_TASK_LIMIT_MB = 200
 _ZIP_MAX_MB_DEFAULT = 10240  # 文件夹打包上限默认值（MB，10GB 对应 QQ 闪传大文件通道）；可在配置中修改，0=不限制
 _SEND_FILES_THRESHOLD_DEFAULT = 3  # 文件夹内文件数 ≤ 此值时逐个发送（原始文件更易命中秒传），超过则打包 zip
@@ -1138,12 +1140,22 @@ def list_share_content(surl: str, pwd: str = "") -> dict:
     return {"text": result["text"], "items": result["items"], "own_share": False}
 
 
-def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue.Queue" = None) -> dict:
+def _user_bucket(user_id: str) -> str:
+    """用户标识 → 转存子目录名（稳定短哈希，不把 QQ 号等原始标识写进网盘目录名）。"""
+    raw = str(user_id or "").strip()
+    if not raw:
+        return "ushared"
+    return "u" + hashlib.blake2b(raw.encode("utf-8"), digest_size=6).hexdigest()
+
+
+def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue.Queue" = None,
+                        cloud_dir: str = "") -> dict:
     """从网盘下载指定路径的文件或文件夹（不转存，直接下载已有文件）。
 
+    cloud_dir: 网盘目录，留空则用全局 CLOUD_SAVE_DIR（调用方通常传本用户的转存子目录）。
     progress_queue: 可选，传入 queue.Queue 后，下载过程中会向队列放入进度信息。
     """
-    cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
+    cloud_dir = cloud_dir or CLOUD_SAVE_DIR or DEFAULT_CLOUD_SAVE_DIR
     if cloud_path:
         full_path = f"{cloud_dir}/{cloud_path.strip('/')}"
         file_name = full_path.rstrip("/").split("/")[-1]
@@ -1398,6 +1410,8 @@ def _get_local_file_size(file_name: str) -> int:
 )
 class BaiduNetdiskPlugin(Star):
 
+    _SHARE_CACHE_MAX_USERS = 50  # 分享缓存最多保留多少个用户，避免长期运行后无限增长
+
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.config = config or {}
@@ -1421,16 +1435,13 @@ class BaiduNetdiskPlugin(Star):
         if cloud_dir:
             CLOUD_SAVE_DIR = cloud_dir.rstrip("/")
         else:
-            CLOUD_SAVE_DIR = "/我的资源/AutoTransfer"
+            CLOUD_SAVE_DIR = DEFAULT_CLOUD_SAVE_DIR
         logger.info(f"[baidu_netdisk] cloud save dir: {CLOUD_SAVE_DIR}")
 
-        # 缓存：链接、密码、目录树、文件列表
-        self._cached_surl = ""
-        self._cached_pwd = ""
-        self._cached_tree = ""
-        self._cached_items = []
-        # 下载去重锁（同一用户同一命令/工具参数只允许一个下载任务）
-        self._active_downloads = set()
+        # 分享缓存：按用户分桶，谁看谁的链接互不覆盖（多人查看不同链接时不会串台）
+        self._share_cache = {}
+        # 下载去重锁：dl_key -> 发起用户，同时用于判断「该用户是否有下载进行中」
+        self._active_downloads = {}
 
         # 设置 BaiduPCS-Go 下载目录（exe 可用时才设置）
         if _ensure_bpcs_exe():
@@ -1486,50 +1497,69 @@ class BaiduNetdiskPlugin(Star):
         else:
             logger.info("[baidu_netdisk] bduuss 配置自动登录成功")
 
-    def _transfer_and_list(self, surl: str, pwd: str) -> dict:
-        """线程安全的"切换分享链接"：API 直连列出分享目录树并更新缓存。
+    def _cloud_dir_for(self, user_id: str) -> str:
+        """该用户的网盘转存目录：<cloud_save_dir>/<用户哈希>。
+        按用户隔离后，下载完成的自动删除只会删掉自己的转存内容。"""
+        base = (CLOUD_SAVE_DIR or DEFAULT_CLOUD_SAVE_DIR).rstrip("/")
+        return f"{base}/{_user_bucket(user_id)}"
+
+    def _cache_get(self, user_id: str) -> dict:
+        """读取该用户的分享缓存（不写入，避免只读操作撑大缓存）。"""
+        return self._share_cache.get(user_id) or {"surl": "", "pwd": "", "tree": "", "items": []}
+
+    def _cache_put(self, user_id: str, surl: str, pwd: str, tree: str, items: list):
+        """写入该用户的分享缓存；缓存按使用者数量封顶，超出的淘汰最早写入的那个。"""
+        self._share_cache.pop(user_id, None)  # 先删再插，保持字典顺序=最近使用
+        self._share_cache[user_id] = {"surl": surl, "pwd": pwd, "tree": tree, "items": items}
+        while len(self._share_cache) > self._SHARE_CACHE_MAX_USERS:
+            self._share_cache.pop(next(iter(self._share_cache)), None)
+
+    def _user_has_active_download(self, user_id: str) -> bool:
+        return user_id in self._active_downloads.values()
+
+    def _transfer_and_list(self, surl: str, pwd: str, user_id: str) -> dict:
+        """线程安全的"切换分享链接"：API 直连列出分享目录树并更新该用户的缓存。
         列目录不转存、也不删暂存目录（下载改为按需精准转存单个文件/文件夹，
         下载完成后由 auto_delete_cloud 清理），多用户查看不同链接互不影响。"""
         with _share_switch_lock:
             result = list_share_content(surl, pwd)
             if "error" not in result:
-                self._cached_surl = surl
-                self._cached_pwd = pwd
-                self._cached_tree = result.get("text", "")
-                self._cached_items = result.get("items", [])
+                self._cache_put(user_id, surl, pwd, result.get("text", ""), result.get("items", []))
         return result
 
-    def _ensure_transferred_sync(self, cloud_path: str) -> dict:
-        """把选中的分享内容（单个文件/文件夹）按 fs_id 精准转存到暂存目录。
+    def _ensure_transferred_sync(self, cloud_path: str, user_id: str) -> dict:
+        """把选中的分享内容（单个文件/文件夹）按 fs_id 精准转存到该用户的暂存目录。
         只转存所需项，避免整包转存撑爆网盘空间（大分享整包动辄上 TB）。
         返回 {"name": 转存后的文件/文件夹名, "is_dir": 是否为文件夹} 或 {"error": ...}。"""
-        if not self._cached_surl:
+        entry = self._cache_get(user_id)
+        surl, pwd = entry["surl"], entry["pwd"]
+        if not surl:
             return {"error": "请先查看目录: /pan <链接> [密码]"}
-        items = self._cached_items or []
+        items = entry["items"] or []
         target = next((it for it in items if it.get("path") == cloud_path), None)
         if not target and items:
             # 路径没命中（树被截断/缓存过期）：重新拉取目录树再找
-            refreshed = _list_share_tree_api(self._cached_surl, self._cached_pwd)
+            refreshed = _list_share_tree_api(surl, pwd)
             if "error" not in refreshed:
-                self._cached_items = refreshed.get("items", [])
-                self._cached_tree = refreshed.get("text", "")
-                items = self._cached_items
+                self._cache_put(user_id, surl, pwd, refreshed.get("text", ""),
+                                refreshed.get("items", []))
+                items = self._cache_get(user_id)["items"]
                 target = next((it for it in items if it.get("path") == cloud_path), None)
         if not target:
             base = cloud_path.strip("/").split("/")[-1]
             target = next((it for it in items if it.get("name") == base), None)
         if not target:
             return {"error": f"分享中找不到「{cloud_path}」，请先 /pan <链接> 查看目录"}
-        cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
-        r = _transfer_via_api(self._cached_surl, self._cached_pwd, cloud_dir,
+        r = _transfer_via_api(surl, pwd, self._cloud_dir_for(user_id),
                               fs_ids=[target["fs_id"]])
         if "error" in r:
             return r
         return {"name": target["name"], "is_dir": bool(target.get("is_dir"))}
 
-    def _check_switch_allowed(self, surl: str) -> str:
-        """切换到新链接前检查是否有下载正在进行（避免缓存被覆盖导致路径串台）。"""
-        if surl and self._cached_surl != surl and self._active_downloads:
+    def _check_switch_allowed(self, surl: str, user_id: str) -> str:
+        """切换到新链接前检查该用户是否有下载正在进行（避免缓存被覆盖导致路径串台）。"""
+        if surl and self._cache_get(user_id)["surl"] != surl \
+                and self._user_has_active_download(user_id):
             return "⏳ 当前有下载任务进行中，请稍后再查看其他链接"
         return ""
 
@@ -1785,16 +1815,16 @@ class BaiduNetdiskPlugin(Star):
         if not surl:
             return "无法解析链接"
 
-        blocked = self._check_switch_allowed(surl)
+        uid = event.get_sender_id()
+        blocked = self._check_switch_allowed(surl, uid)
         if blocked:
             return blocked
 
-        result = await asyncio.to_thread(self._transfer_and_list, surl, pwd)
+        result = await asyncio.to_thread(self._transfer_and_list, surl, pwd, uid)
         if "error" in result:
             return result["error"]
-        cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
         return (f"{result['text']}\n\n"
-                f"（环境信息：网盘转存目录为 {cloud_dir}，本地下载目录为 {DOWNLOAD_DIR}，"
+                f"（环境信息：网盘转存目录为 {self._cloud_dir_for(uid)}，本地下载目录为 {DOWNLOAD_DIR}，"
                 f"后续转存/下载结果都在这两个目录下）")
 
     @filter.llm_tool(name="pan_download_dir")
@@ -1817,32 +1847,33 @@ class BaiduNetdiskPlugin(Star):
         if link:
             surl, pwd = self._normalize_link(link, pwd)
 
+        uid = event.get_sender_id()
         if surl:
-            blocked = self._check_switch_allowed(surl)
+            blocked = self._check_switch_allowed(surl, uid)
             if blocked:
                 return blocked
-            result = await asyncio.to_thread(self._transfer_and_list, surl, pwd)
+            result = await asyncio.to_thread(self._transfer_and_list, surl, pwd, uid)
             if "error" in result:
                 return result["error"]
-        elif not self._cached_surl:
+        elif not self._cache_get(uid)["surl"]:
             return "请先查看目录: /pan <链接> [密码]"
 
-        dl_key = f"tool:pan_download_dir:{event.get_sender_id()}:{folder_path}"
+        dl_key = f"tool:pan_download_dir:{uid}:{folder_path}"
         if dl_key in self._active_downloads:
             logger.warning(f"[baidu_netdisk] pan_download_dir: duplicate blocked: {dl_key}")
             return "⏳ 该文件正在下载中，请稍候..."
-        self._active_downloads.add(dl_key)
+        self._active_downloads[dl_key] = uid
         try:
             # 按需精准转存：只转存选中的文件夹，再从暂存目录下载
-            tr = await asyncio.to_thread(self._ensure_transferred_sync, folder_path)
+            tr = await asyncio.to_thread(self._ensure_transferred_sync, folder_path, uid)
             if "error" in tr:
                 return tr["error"]
             prog_q = queue.Queue() if self._progress_enabled else None
-            dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, tr["name"], self._get_max_mb(), prog_q))
+            dl_future = asyncio.create_task(asyncio.to_thread(
+                download_from_cloud, tr["name"], self._get_max_mb(), prog_q,
+                self._cloud_dir_for(uid)))
             if prog_q:
                 file_info = None
-                _last_prog_size = None
-                _last_prog_time = None
                 while not dl_future.done():
                     try:
                         msg = prog_q.get_nowait()
@@ -1867,16 +1898,16 @@ class BaiduNetdiskPlugin(Star):
 
             if dl.get("is_dir"):
                 # 文件夹不能直接发送：≤阈值逐个发，否则打包 zip，超限则降级为路径+清单
-                share_url = f"https://pan.baidu.com/s/{self._cached_surl}"
+                share_url = f"https://pan.baidu.com/s/{self._cache_get(uid)['surl']}"
                 return await self._send_folder(event, dl, share_url)
             else:
-                share_url = f"https://pan.baidu.com/s/{self._cached_surl}"
+                share_url = f"https://pan.baidu.com/s/{self._cache_get(uid)['surl']}"
                 sent = await self._send_file(event, dl, share_url)
                 if sent:
                     return f"文件 '{folder_path}' 下载并发送完成，本地路径: {dl['path']}"
                 return f"文件 '{folder_path}' 已下载到 {dl['path']}，但发送失败"
         finally:
-            self._active_downloads.discard(dl_key)
+            self._active_downloads.pop(dl_key, None)
 
     @filter.llm_tool(name="pan_download_all")
     async def pan_download_all(self, event: AstrMessageEvent, link: str = "", pwd: str = ""):
@@ -1896,31 +1927,34 @@ class BaiduNetdiskPlugin(Star):
         if link:
             surl, pwd = self._normalize_link(link, pwd)
 
+        uid = event.get_sender_id()
         if surl:
-            blocked = self._check_switch_allowed(surl)
+            blocked = self._check_switch_allowed(surl, uid)
             if blocked:
                 return blocked
-            result = await asyncio.to_thread(self._transfer_and_list, surl, pwd)
+            result = await asyncio.to_thread(self._transfer_and_list, surl, pwd, uid)
             if "error" in result:
                 return result["error"]
-        elif not self._cached_surl:
+        elif not self._cache_get(uid)["surl"]:
             return "请先查看目录: /pan <链接> [密码]"
 
-        dl_key = f"tool:pan_download_all:{event.get_sender_id()}"
+        dl_key = f"tool:pan_download_all:{uid}"
         if dl_key in self._active_downloads:
             logger.warning(f"[baidu_netdisk] pan_download_all: duplicate blocked: {dl_key}")
             return "⏳ 该文件正在下载中，请稍候..."
-        self._active_downloads.add(dl_key)
+        self._active_downloads[dl_key] = uid
         try:
-            # 先转存分享根目录全部文件到暂存目录，再整体下载
+            # 先转存分享根目录全部文件到该用户的暂存目录，再整体下载
             # （特大分享会因网盘剩余空间不足失败，错误信息会提示改用按文件下载）
             tr = await asyncio.to_thread(
-                _transfer_via_api, self._cached_surl, self._cached_pwd,
-                CLOUD_SAVE_DIR or "/我的资源/AutoTransfer")
+                _transfer_via_api, self._cache_get(uid)["surl"], self._cache_get(uid)["pwd"],
+                self._cloud_dir_for(uid))
             if "error" in tr:
                 return tr["error"]
             prog_q = queue.Queue() if self._progress_enabled else None
-            dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, "", self._get_max_mb(), prog_q))
+            dl_future = asyncio.create_task(asyncio.to_thread(
+                download_from_cloud, "", self._get_max_mb(), prog_q,
+                self._cloud_dir_for(uid)))
             if prog_q:
                 while not dl_future.done():
                     try:
@@ -1937,16 +1971,16 @@ class BaiduNetdiskPlugin(Star):
                 return dl["error"]
 
             # 全部下载本质也是文件夹：≤阈值逐个发，否则打包 zip，超限则降级为路径+清单
-            share_url = f"https://pan.baidu.com/s/{self._cached_surl}"
+            share_url = f"https://pan.baidu.com/s/{self._cache_get(uid)['surl']}"
             return await self._send_folder(event, dl, share_url, label="全部文件")
         finally:
-            self._active_downloads.discard(dl_key)
+            self._active_downloads.pop(dl_key, None)
 
     @filter.llm_tool(name="pan_transfer")
     async def pan_transfer(self, event: AstrMessageEvent, link: str = "", pwd: str = "", path: str = ""):
         """把百度网盘分享中的文件或文件夹转存到自己的网盘（不下载到本地）。用户说"转存一下"、"存到我的网盘"、"先转存"时调用。
         path 传 pan_list 目录树中显示的路径则只转存该项（需要网盘剩余空间大于该项大小）；不传 path 则转存分享根目录的全部内容（特大分享会因空间不足失败）。
-        转存结果在网盘的暂存目录（默认 /我的资源/AutoTransfer）下，回复用户时把转存到的网盘路径一起告诉用户。
+        转存结果在网盘的暂存目录下（<配置的转存目录>/<该用户的隔离子目录>），回复用户时把转存到的完整网盘路径一起告诉用户。
 
         Args:
             link(string): 百度网盘分享链接（可选，如未查看过目录则需提供；也可传整段分享文案，会自动识别链接与提取码）
@@ -1960,25 +1994,26 @@ class BaiduNetdiskPlugin(Star):
         if link:
             surl, pwd = self._normalize_link(link, pwd)
 
+        uid = event.get_sender_id()
         if surl:
-            blocked = self._check_switch_allowed(surl)
+            blocked = self._check_switch_allowed(surl, uid)
             if blocked:
                 return blocked
-            result = await asyncio.to_thread(self._transfer_and_list, surl, pwd)
+            result = await asyncio.to_thread(self._transfer_and_list, surl, pwd, uid)
             if "error" in result:
                 return result["error"]
-        elif not self._cached_surl:
+        elif not self._cache_get(uid)["surl"]:
             return "请先查看目录: /pan <链接> [密码]"
 
-        cloud_dir = CLOUD_SAVE_DIR or "/我的资源/AutoTransfer"
+        cloud_dir = self._cloud_dir_for(uid)
         if path:
-            tr = await asyncio.to_thread(self._ensure_transferred_sync, path)
+            tr = await asyncio.to_thread(self._ensure_transferred_sync, path, uid)
             if "error" in tr:
                 return tr["error"]
             return f"✅ 已转存「{path}」到网盘 {cloud_dir}/{tr['name']}"
         # 未指定 path：转存分享根目录全部内容
         tr = await asyncio.to_thread(
-            _transfer_via_api, self._cached_surl, self._cached_pwd, cloud_dir)
+            _transfer_via_api, self._cache_get(uid)["surl"], self._cache_get(uid)["pwd"], cloud_dir)
         if "error" in tr:
             return tr["error"]
         names = "、".join(tr.get("filenames", [])[:10]) or "全部内容"
@@ -2205,7 +2240,8 @@ class BaiduNetdiskPlugin(Star):
 
         if self._is_blacklisted(event):
             return
-        dl_key = f"{event.get_sender_id()}:{str(args).strip()}"
+        uid = event.get_sender_id()
+        dl_key = f"{uid}:{str(args).strip()}"
         _lock_acquired = False
         parts = [p for p in str(args).split() if p]
         if not parts or parts[0] == "help":
@@ -2304,8 +2340,9 @@ class BaiduNetdiskPlugin(Star):
                 return
 
         if parts[0] == "look":
-            if self._cached_tree:
-                yield event.plain_result(self._cached_tree)
+            cached_tree = self._cache_get(uid)["tree"]
+            if cached_tree:
+                yield event.plain_result(cached_tree)
             else:
                 yield event.plain_result("请先使用 /pan <链接> [密码] 查看目录")
             return
@@ -2316,8 +2353,8 @@ class BaiduNetdiskPlugin(Star):
             return
 
         if parts[0] == "down":
-            # 下载文件夹或单个文件（自动识别类型）；使用缓存的链接
-            if not self._cached_surl:
+            # 下载文件夹或单个文件（自动识别类型）；使用本用户缓存的链接
+            if not self._cache_get(uid)["surl"]:
                 yield event.plain_result("请先使用 /pan <链接> [密码] 查看目录")
                 return
             if len(parts) < 2:
@@ -2330,11 +2367,11 @@ class BaiduNetdiskPlugin(Star):
                 logger.warning(f"[baidu_netdisk] on_pan: duplicate download blocked: {dl_key}")
                 yield event.plain_result("⏳ 该文件正在下载中，请稍候...")
                 return
-            self._active_downloads.add(dl_key)
+            self._active_downloads[dl_key] = uid
             _lock_acquired = True
             try:
                 logger.info(f"[baidu_netdisk] on_pan down: dl_path={dl_path}, progress_enabled={self._progress_enabled}")
-                tr = await asyncio.to_thread(self._ensure_transferred_sync, dl_path)
+                tr = await asyncio.to_thread(self._ensure_transferred_sync, dl_path, uid)
                 if "error" in tr:
                     yield event.plain_result(f"❌ {tr['error']}")
                     return
@@ -2342,7 +2379,9 @@ class BaiduNetdiskPlugin(Star):
                 kind = "文件夹" if tr.get("is_dir") else "文件"
                 yield event.plain_result(f"⏳ 正在下载{kind}: {dl_path} ...")
                 prog_q = queue.Queue() if self._progress_enabled else None
-                dl_future = asyncio.create_task(asyncio.to_thread(download_from_cloud, tr["name"], self._get_max_mb(), prog_q))
+                dl_future = asyncio.create_task(asyncio.to_thread(
+                    download_from_cloud, tr["name"], self._get_max_mb(), prog_q,
+                    self._cloud_dir_for(uid)))
                 if prog_q:
                     file_info = None
                     _last_prog_size = None
@@ -2400,13 +2439,13 @@ class BaiduNetdiskPlugin(Star):
                 else:
                     if dl.get("is_dir"):
                         # 文件夹不能直接发送：≤阈值逐个发，否则打包 zip，超限则降级为路径+清单
-                        share_url = f"https://pan.baidu.com/s/{self._cached_surl}"
+                        share_url = f"https://pan.baidu.com/s/{self._cache_get(uid)['surl']}"
                         yield event.plain_result(await self._send_folder(event, dl, share_url))
                     else:
                         yield event.chain_result([File(name=dl.get("name", "file"), file=dl["path"])])
             finally:
                 if _lock_acquired:
-                    self._active_downloads.discard(dl_key)
+                    self._active_downloads.pop(dl_key, None)
             return
 
         # 默认: /pan <链接> [密码] → 查看目录树（整串交给 _normalize_link 统一解析）
@@ -2416,13 +2455,13 @@ class BaiduNetdiskPlugin(Star):
             yield event.plain_result("❌ 无法解析链接")
             return
 
-        blocked = self._check_switch_allowed(surl)
+        blocked = self._check_switch_allowed(surl, uid)
         if blocked:
             yield event.plain_result(f"❌ {blocked}")
             return
 
         yield event.plain_result("⏳ 正在获取目录结构...")
-        result = await asyncio.to_thread(self._transfer_and_list, surl, pwd)
+        result = await asyncio.to_thread(self._transfer_and_list, surl, pwd, uid)
         if "error" in result:
             yield event.plain_result(f"❌ {result['error']}")
         else:
