@@ -44,7 +44,7 @@ except ImportError:  # 兼容旧版 AstrBot
     "astrbot_plugin_baidu_netdisk",
     "XTsat",
     "百度网盘分享文件自动下载发送",
-    "2.0.0",
+    "2.1.0",
     "https://github.com/XTsat/astrbot_plugin_baidu_netdisk",
 )
 class BaiduNetdiskPlugin(Star):
