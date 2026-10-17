@@ -1,4 +1,3 @@
-core/
 storage/
 __pycache__/
 *.pyc

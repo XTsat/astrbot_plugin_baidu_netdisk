@@ -20,7 +20,10 @@
 
 | 文件 | 必选 | 职责 |
 |------|------|------|
-| `main.py` | ✅ | 插件主体，全部后端逻辑 |
+| `main.py` | ✅ | 插件入口：`BaiduNetdiskPlugin`（`Star` 子类）、命令与 LLM 工具注册、生命周期 |
+| `domain/` | ✅ | 领域层：常量、路径、运行期可变状态（最底层，无内部依赖） |
+| `utils/` | ✅ | 工具层：尺寸/链接/文件/GitHub/BaiduPCS-Go 通用函数 |
+| `core/` | ✅ | 核心层：下载并发槽位、网盘 Web API、下载执行 |
 | `metadata.yaml` | ✅ | 插件元数据（name、version、author、desc、repo、support_platforms） |
 | `_conf_schema.json` | ✅ | WebUI 配置 Schema（定义所有可配置项的类型、默认值、枚举） |
 | `README.md` | ✅ | 中文文档（功能说明、命令表、配置说明、常见问题） |
@@ -40,7 +43,21 @@
 
 ```
 astrbot_plugin_baidu_netdisk/
-├── main.py                 # 全部后端逻辑（本项目为单文件风格）
+├── main.py                 # 插件入口：Star 子类、命令与 LLM 工具、生命周期
+├── domain/                 # 领域层（最底层，无内部依赖）
+│   ├── constants.py        # 不可变常量、用户文案、正则、单位表、host 白名单
+│   ├── paths.py            # 插件目录、数据目录、派生路径、跨模块文件锁
+│   └── state.py            # 运行期可变状态单例 state
+├── utils/                  # 工具层（禁止 import core/ 或 main）
+│   ├── size.py             # 尺寸解析与格式化
+│   ├── link.py             # 分享链接与提取码解析
+│   ├── fs.py               # 原子写、JSON 事务、通知/清单、目录遍历
+│   ├── github.py           # GitHub release 下载与镜像
+│   └── bpcs.py             # BaiduPCS-Go 配置与登录
+├── core/                   # 核心层（禁止 import main）
+│   ├── concurrency.py      # 下载槽位与去重守卫
+│   ├── panapi.py           # 网盘 Web API（预检、转存、目录树）
+│   └── download.py         # 下载执行与本地文件核对
 ├── metadata.yaml           # 插件元数据
 ├── _conf_schema.json       # 插件配置 Schema
 ├── CHANGELOG.md            # 变更日志
@@ -61,12 +78,29 @@ AstrBot 插件有两种主流架构风格，**新建项目时二选一，并在�
 | **单文件** | 逻辑简单（< 1500 行） | `astrbot_plugin_msg_forward_cc`、`astrbot_plugin_model_status` |
 | **分层多文件** | 逻辑复杂，需模块化 | `astrbot_plugin_help_panel_typst`（main.py → core → utils → domain） |
 
-**本项目采用单文件风格**（`main.py`，约 3800 行，已远超模板建议的 1500 行阈值）。**单文件风格绝不等于允许重复实现**：同一件事只允许有一处实现，见下方「单文件风格」第 3 条。
+**本项目采用分层多文件风格**：逻辑已从单文件（约 3800 行）按本节规范拆分，`main.py` 现约 1450 行，只留插件入口。
 
-**单文件风格**：
-- 所有逻辑在 `main.py` 一个文件中，通过注释分隔条组织：`# 内部工具方法 → # Web API → # 数据持久化 → # 执行与调度 → # 聊天命令 → # 生命周期`
-- 新增方法按职责放入对应分区；当前 `main.py` 尚未全面铺设 `# ---- 分区名 ----` 分隔条，新增分区时补上
-- **同一逻辑只能有一处实现（强制）**：跨入口复用的校验、文案、发送链路、文件读写、路径解析必须抽成模块级 helper 或类内 `_x` 方法，由各调用点复用。典型必须抽取的场景：
+**分层多文件风格（本项目现行）**：
+- 依赖方向严格单向：`main.py → core → utils / domain`；`utils → domain`；`domain` 不依赖任何人。新增代码按此放置，禁止向上 import
+- `domain/`：最底层，无内部依赖
+  - `constants.py`：不可变常量、用户文案 `_MSG_*`、正则、单位表、host 白名单
+  - `paths.py`：插件目录 `PLUGIN_DIR`、数据目录、派生路径与跨模块文件锁
+  - `state.py`：运行期**可变**状态单例 `state`（见下方「可变状态」）
+- `utils/`：通用工具层，禁止 import `core/` 或 `main`
+  - `size.py` 尺寸解析与格式化、`link.py` 分享链接解析、`fs.py` 原子写/JSON 事务/通知清单/目录遍历、`github.py` release 下载与镜像、`bpcs.py` BaiduPCS-Go 配置与登录
+- `core/`：核心业务层，可依赖 `utils/` 与 `domain/`，禁止 import `main`
+  - `concurrency.py` 下载槽位与去重守卫、`panapi.py` 网盘 Web API、`download.py` 下载执行与本地文件核对
+- `main.py`：只放 `BaiduNetdiskPlugin`——`@register`、`@filter` 装饰器方法、`__init__`、`terminate`。**装饰器方法必须留在 `main.py`**：AstrBot 的处理器注册依赖类体扫描，挪进 mixin 或子类有漏注册风险
+- **跨文件 import 必须用相对形式（强制）**：AstrBot 以 `data.plugins.<插件名>.main` 包形式加载插件（`star_manager` 用 `__import__(path, fromlist=[...])`），因此写 `from .utils.fs import ...` / `from ..domain.state import state`。禁止裸 `import utils.fs`，也禁止把插件目录塞进 `sys.path`
+- 新增常量 → 放 `domain/constants.py`，禁止散落硬编码
+- 新增配置项 → 改 `_conf_schema.json` + `main.py` 的配置读取段（本项目配置项集中在 `__init__` 读取）
+
+**可变状态（强制）**：
+- 会在运行期被重新赋值的模块级状态，一律放 `domain/state.py` 的 `state` 单例，读写都走 `state.xxx`
+- 禁止跨模块用 `global` 改值，也禁止在别处再定义同名模块级变量：`from x import 变量` 拿到的是 import 那一刻的快照，跨模块重新赋值不可见，会造成「改了没生效」的隐蔽 bug
+- 不会被重新赋值的锁与哨兵对象可留在各自模块（`_FILE_WRITE_LOCK` 等在 `domain/paths.py`，`_SKIP_WRITE` 在 `utils/fs.py`）
+
+**同一逻辑只能有一处实现（强制，与架构风格无关）**：跨入口复用的校验、文案、发送链路、文件读写、路径解析必须抽成模块级 helper 或类内 `_x` 方法，由各调用点复用。典型必须抽取的场景：
   - 同一段用户文案出现在 ≥2 个入口 → 抽成模块级 `_MSG_*` 常量（命令路径自行加 `❌` 前缀，常量本身不带）
   - 多个 LLM 工具/命令分支的「受理前奏」（黑名单 → 解析链接 → 取缓存 → 校验）→ 抽成一个受理 helper
   - 多个「执行 → 成功/失败回应」骨架 → 抽成接收动作回调的 helper，成功文案由调用方传入
@@ -75,19 +109,11 @@ AstrBot 插件有两种主流架构风格，**新建项目时二选一，并在�
 - **多条实现路径共享的部分要抽出来，外层差异保留**：如「命令路径 yield / 后台任务 send」两种发射方式，只抽中间的解析与分类逻辑，不强行统一发射方式
 - 新增 helper 必须写清 non-obvious reason（见 7.3），尤其是「为什么这里不能和某处合并」
 
-**分层多文件风格**（本项目当前不适用，保留规范供拆分后参考）：
-- 依赖方向严格单向：`main.py → core → utils / domain`；`utils → domain`；`domain` 不依赖任何人
-- `domain/`：数据定义层（constants、config、schemas），最底层，无内部依赖
-- `utils/`：通用工具层（font、image、hash 等），禁止 import core/ 或 main
-- `core/`：核心业务层（analyzer、renderer、worker），纯 Python 逻辑
-- 新增常量 → 放 `domain/constants.py`，禁止散落硬编码
-- 新增配置项 → 改 `domain/config.py` 的 dataclass 字段 + 兜底逻辑 + `_conf_schema.json`
-
 ### 2.3 本项目特有约定与偏差
 
 > 以下是本项目相对来源模板的**已知偏差**，改文档时不得按模板默认值「纠偏」回去。
 
-1. **单文件风格**：全部逻辑在 `main.py`，不拆分模块（见 2.2）。但「单文件」只约束**文件数量**，不豁免 2.2 的「同一逻辑只能有一处实现」：跨入口共享的文案、校验、发送链路、读写事务必须抽成 helper 复用，禁止复制粘贴出第二份。用户已明确「先把重复逻辑合并」，拆分文件（`core/` + `utils/`）仍待用户单独确认。
+1. **分层多文件风格**：逻辑已从单文件拆为 `main.py → core → utils → domain`（见 2.2）。拆分只解决文件体积，不豁免 2.2 的「同一逻辑只能有一处实现」。`main.py` 保留全部装饰器方法，不拆 mixin；运行期可变状态集中在 `domain/state.py`，不用 `global` 跨模块改值。
 2. **仅维护中文 README**：本项目**只有 `README.md`，未创建 `README_en.md`**（用户已确认）。7.2 中关于英文版的要求在创建英文版之前不适用；新增文档章节时只落中文版，不要凭空新建英文文件。
 3. **外部依赖 BaiduPCS-Go**：插件不内置该二进制，按平台自动下载（Windows / Linux / macOS，x64 / arm64），国内镜像兜底仅 Windows 版；相关行为变更必须同步 README 与 CHANGELOG。
 4. **插件数据目录**：`data/plugin_data/astrbot_plugin_baidu_netdisk/`（经 `StarTools.get_data_dir()` 解析，另有旧版 AstrBot 兼容回退）。
@@ -495,12 +521,20 @@ README 正文严格按以下 4 大板块组织，但不强制使用 `##` 标题�
 - 项目无强制测试框架，**改动后自检语法与逻辑即可**
 - 若项目已补充单测，改动后需保证测试通过
 - 格式检查：`python -m ruff format .`（如果项目历史有 ruff 提交）
+- **本地导入自检**：本插件用相对 import，不能用 `python -c "import main"`。在插件目录的**上一级**执行（把 AstrBot 的 `data/plugins` 视为包根）：
+
+  ```bash
+  cd .. && python -c "import astrbot_plugin_baidu_netdisk.main"
+  ```
+
+  目录名即包名，Python 3 命名空间包无需 `__init__.py` 也能导入。
 
 ---
 
 ## 9. 最终检查清单（每次任务完成前）
 
-- [ ] 架构：所选风格（单文件 / 分层多文件）与既有代码一致
+- [ ] 架构：分层方向未被打破（`domain` 不 import 其它层，`utils` 不 import `core`/`main`，`core` 不 import `main`）
+- [ ] 可变状态：新增的运行期可变状态放在 `domain/state.py`，未跨模块用 `global` 改值
 - [ ] 注释：只写 non-obvious reason，无残留中间状态、无被注释掉的旧代码
 - [ ] 日志：`[baidu_netdisk]` 前缀，异常分类记录，无空 catch
 - [ ] CHANGELOG：`[Unreleased]` 已追加条目，条目面向用户（无内部实现细节），保留了他人的既有记录
@@ -509,4 +543,4 @@ README 正文严格按以下 4 大板块组织，但不强制使用 `##` 标题�
 - [ ] 配置：新增配置项已在 `_conf_schema.json` 和代码中同步
 - [ ] 提交信息：Conventional Commits 格式（`type: 中文短句式`）
 - [ ] 提交/推送：已取得用户对本次改动的明确确认（一次性授权，未沿用上一轮）
-- [ ] 本地测试：`python -c "import main"` 无语法错误（或 ruff 格式通过）
+- [ ] 本地测试：`cd .. && python -c "import astrbot_plugin_baidu_netdisk.main"` 无报错（见 8.3）
