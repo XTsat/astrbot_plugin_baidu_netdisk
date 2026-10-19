@@ -60,6 +60,12 @@
       "send_mode": "onebot"
     }
   },
+  "plugin_admins": {
+    "type": "string",
+    "description": "插件管理员",
+    "hint": "填入用户 ID（QQ 号等），多个用英文逗号隔开；这些用户可使用 /pan login 与 /pan pcs，留空则仅机器人管理员可用",
+    "default": ""
+  },
   "download_dir": {
     "type": "string",
     "description": "文件下载目录",

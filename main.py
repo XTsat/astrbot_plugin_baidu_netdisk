@@ -108,6 +108,17 @@ class BaiduNetdiskPlugin(Star):
         if self._blacklist:
             logger.info(f"[baidu_netdisk] blacklist: {self._blacklist}")
 
+        # 插件管理员：不是机器人管理员也能使用 /pan login、/pan pcs 等管理类命令
+        aw = str(self.config.get("plugin_admins", "")).strip()
+        self._plugin_admins = set()
+        if aw:
+            for uid in re.split(r"[,，\s]+", aw):
+                uid = uid.strip()
+                if uid:
+                    self._plugin_admins.add(uid)
+        if self._plugin_admins:
+            logger.info(f"[baidu_netdisk] plugin admins: {self._plugin_admins}")
+
         # 读取下载后自动删除网盘文件开关
         state.auto_delete_cloud = _config_bool(self.config, "auto_delete_cloud", True)
         logger.info(f"[baidu_netdisk] auto_delete_cloud: {state.auto_delete_cloud}")
@@ -491,6 +502,14 @@ class BaiduNetdiskPlugin(Star):
                     pct = min(current / total * 100, 99.9)
                     await event.send(event.plain_result(f"⏬ 下载中: {pct:.1f}%"))
             await self._interruptible_sleep(dl_future, self._progress_interval)
+
+    def _is_plugin_admin(self, event: AstrMessageEvent) -> bool:
+        """机器人管理员，或配置在「插件管理员」里的用户。
+
+        插件管理员只放宽本插件的管理类命令（/pan login、/pan pcs），不改变 AstrBot 的权限体系。"""
+        if event.is_admin():
+            return True
+        return event.get_sender_id() in self._plugin_admins
 
     def _is_blacklisted(self, event: AstrMessageEvent) -> bool:
         if self._get_send_mode() != "onebot":
@@ -1234,7 +1253,7 @@ class BaiduNetdiskPlugin(Star):
                 "/pan down <序号或路径>  下载文件夹或文件（自动识别类型；也支持直接传链接一键下载）",
                 "💡 目录树每项前面的数字就是序号，可直接 /pan down 3 下载第 3 项",
                 "/pan download <链接> [密码]  解析后自动下载整个分享",
-                "（以下命令仅管理员可用，因为它们会改变全群共用的百度账号与运行工具）",
+                "（以下命令仅管理员可用，可在插件配置「插件管理员」中授权他人；它们会改变全群共用的账号与工具）",
                 "/pan login  登录/退出统一入口（发送 /pan login 查看登录菜单）",
                 "/pan pcs  下载/更新 BaiduPCS-Go 工具（直连失败时自动挑选可用加速镜像）",
                 "/pan pcs git  强制直连 GitHub 官方原始链接（不用代理、不用镜像）",
@@ -1244,21 +1263,22 @@ class BaiduNetdiskPlugin(Star):
             yield event.plain_result("\n".join(help_lines))
             return
 
-        if parts[0].lower() == "login" and not event.is_admin():
+        if parts[0].lower() == "login" and not self._is_plugin_admin(event):
             # 登录/退出改的是全群共用的那一个百度账号：任何人 /pan login 0 就能把账号注销，
             # 或用 /pan login 3/4 把账号换成自己的（之后所有人的下载都转存进攻击者网盘）。
             # 因此与 /pan pcs 一样按管理类命令处理；这里放在 exe 自动下载之前，避免普通用户
             # 仅靠发一条 login 就触发二进制下载。
             yield event.plain_result(
                 "⛔ 登录/退出仅管理员可用：该操作会影响全群共用的百度账号。\n"
-                "💡 若插件尚未登录或提示工具缺失，请联系管理员执行 /pan login。")
+                "💡 若插件尚未登录或提示工具缺失，请联系管理员执行 /pan login"
+                "（管理员可在插件配置「插件管理员」中授权你操作）。")
             return
 
         if parts[0].lower() == "pcs":
             # 该命令会主动下载并替换机器人本地运行的可执行文件，也能改写下载来源
             # （加速镜像/代理），属管理类操作：普通用户只使用登录时自动触发、
             # 来源不可更改的下载，因此这里要求管理员身份
-            if not event.is_admin():
+            if not self._is_plugin_admin(event):
                 yield event.plain_result(
                     "⛔ /pan pcs 仅管理员可用。\n"
                     f"💡 普通用户无需手动操作：管理员登录后插件会自动下载所需的 {_BPCS_EXE_NAME}。"
@@ -1330,14 +1350,14 @@ class BaiduNetdiskPlugin(Star):
             if parts[0] != "login":
                 yield event.plain_result(
                     f"❌ {_BPCS_EXE_NAME} 缺失或损坏，暂时无法执行该命令；"
-                    f"{'可用 /pan pcs 下载修复' if event.is_admin() else '请联系管理员处理'}"
+                    f"{'可用 /pan pcs 下载修复' if self._is_plugin_admin(event) else '请联系管理员处理'}"
                 )
                 return
             yield event.plain_result("⏳ BaiduPCS-Go 不存在或不可用，正在自动下载（GitHub 官方 release 优先，直连失败时自动挑选可用加速镜像）...")
             if not await asyncio.to_thread(_auto_download_bpcs, self._allow_insecure_tls()):
                 yield event.plain_result(
                     f"❌ BaiduPCS-Go 自动下载失败：{state.auto_dl_last_error or '未知原因'}。"
-                    f"请稍后重试{'（或用 /pan pcs 手动下载）' if event.is_admin() else '，或联系管理员处理'}"
+                    f"请稍后重试{'（或用 /pan pcs 手动下载）' if self._is_plugin_admin(event) else '，或联系管理员处理'}"
                 )
                 return
 
