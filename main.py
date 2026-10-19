@@ -1231,8 +1231,9 @@ class BaiduNetdiskPlugin(Star):
                 "/pan <链接> [密码]  查看目录树（每项带序号）",
                 "💡 可直接粘贴整段分享文案（含“链接:”与“提取码:”），自动识别链接与提取码",
                 "/pan look  重新查看目录树（序号不变）",
-                "/pan down <序号或路径>  下载文件夹或文件（自动识别类型）",
+                "/pan down <序号或路径>  下载文件夹或文件（自动识别类型；也支持直接传链接一键下载）",
                 "💡 目录树每项前面的数字就是序号，可直接 /pan down 3 下载第 3 项",
+                "/pan download <链接> [密码]  解析后自动下载整个分享",
                 "（以下命令仅管理员可用，因为它们会改变全群共用的百度账号与运行工具）",
                 "/pan login  登录/退出统一入口（发送 /pan login 查看登录菜单）",
                 "/pan pcs  下载/更新 BaiduPCS-Go 工具（直连失败时自动挑选可用加速镜像）",
@@ -1354,14 +1355,47 @@ class BaiduNetdiskPlugin(Star):
                 yield r
             return
 
-        if parts[0] == "down":
+        # down 与 download 等价：参数是分享链接时，先解析目录再自动下载整个分享
+        if parts[0].lower() in ("down", "download"):
+            rest = " ".join(parts[1:])
+            # 只有明确的分享链接/分享文案才按「一键下载整个分享」处理：
+            # 单纯几个字母的文件名（如 test）不能被当成裸 surl，否则会误转存别的内容
+            one_shot_surl, _ = parse_share_link(rest)
+            if one_shot_surl:
+                one_shot_surl, one_shot_pwd = self._normalize_link(rest, "")
+                dl_key = f"{uid}:down:all:{one_shot_surl}"
+                if dl_key in self._active_downloads or dl_key in self._pending_jobs:
+                    yield event.plain_result(_MSG_BUSY)
+                    return
+                # 先解析：链接失效、提取码错误在这里直接报错，不会先回「已受理」再失败；
+                # 与查看链接同样先确认没有别的下载在跑，避免把缓存换成另一个分享
+                blocked = self._check_switch_allowed(one_shot_surl, uid)
+                if blocked:
+                    yield event.plain_result(f"❌ {blocked}")
+                    return
+                yield event.plain_result("⏳ 正在解析分享目录...")
+                result = await asyncio.to_thread(self._transfer_and_list, one_shot_surl, one_shot_pwd, uid)
+                if "error" in result:
+                    yield event.plain_result(f"❌ {result['error']}")
+                    return
+                # 解析完交给后台任务下载（与 AI 工具 pan_download_all 同一条链路）：
+                # 命令本身不阻塞到下载结束，任务完成/失败会把结果直接发到当前会话
+                self._spawn_background_job(self._job_download_and_send(
+                    event, uid, dl_key, "", "", one_shot_pwd, one_shot_surl), dl_key, uid)
+                yield event.plain_result(
+                    "✅ 已解析分享并开始下载全部内容（目录树已缓存，可用 /pan look 查看）。"
+                    "若前面已有下载任务，本次会先排队；完成后把文件直接发到这里")
+                return
+
             # 下载文件夹或单个文件（自动识别类型）；使用本用户缓存的链接与目录树
             cached = self._cache_get(uid)
             if not cached["surl"]:
                 yield event.plain_result("请先使用 /pan <链接> [密码] 查看目录")
                 return
             if len(parts) < 2:
-                yield event.plain_result("用法: /pan down <序号或路径>（先 /pan <链接> 查看目录）")
+                yield event.plain_result(
+                    "用法: /pan down <序号或路径>（先 /pan <链接> 查看目录），"
+                    "或 /pan download <链接> [密码] 直接下载整个分享")
                 return
             # 路径可能含空格，拼回完整参数；纯数字（如 3）按目录树序号解析
             dl_path, sel_err = self._resolve_tree_selection(cached, " ".join(parts[1:]))
