@@ -78,6 +78,20 @@
     "hint": "转存文件在网盘中的保存路径，如 /我的资源/AutoTransfer 。留空则使用默认 /我的资源/AutoTransfer",
     "default": ""
   },
+  "user_dir_mode": {
+    "type": "string",
+    "description": "用户隔离子目录命名方式",
+    "hint": "hash: 用哈希值命名，不把 QQ 号等原始标识写进网盘目录名（隐私，默认）；raw: 直接用发送者 ID（如 QQ 号）命名，便于在网盘里按用户核查。切换后只影响之后的转存，已存在的隔离子目录不会自动迁移",
+    "options": [
+      "hash",
+      "raw"
+    ],
+    "labels": [
+      "哈希（隐私，默认）",
+      "原始 ID（如 QQ 号，便于核查）"
+    ],
+    "default": "hash"
+  },
   "auto_delete_cloud": {
     "type": "bool",
     "description": "下载后自动删除网盘文件",

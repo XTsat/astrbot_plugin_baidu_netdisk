@@ -8,6 +8,8 @@
 不可变的配置常量与文案不在此处，见 `domain/constants.py`。
 """
 
+from .constants import DEFAULT_USER_DIR_MODE
+
 
 class _RuntimeState:
     """插件进程内的运行时状态单例（模块底部实例化）。"""
@@ -15,6 +17,7 @@ class _RuntimeState:
     # 数据目录：__init__ 按配置改写，未初始化前为 None
     download_dir: str | None = None
     cloud_save_dir: str | None = None
+    user_dir_mode: str = DEFAULT_USER_DIR_MODE  # 用户隔离子目录命名：hash=哈希（隐私）/ raw=原始 ID（便于核查）
 
     # 下载调度
     download_semaphore: object | None = None

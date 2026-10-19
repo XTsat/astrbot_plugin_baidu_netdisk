@@ -25,7 +25,7 @@ from astrbot.core.star.filter.command import GreedyStr
 from .core.concurrency import _DownloadGuard, _DuplicateDownloadError, _get_download_semaphore, _release_download_slot
 from .core.download import _config_bool, _config_int, download_from_cloud, _get_local_file_size, _next_progress, _zip_files
 from .core.panapi import list_share_content, _list_share_tree_api, _share_switch_lock, _transfer_via_api
-from .domain.constants import _BPCS_EXE_NAME, _BROWSER_UA, DEFAULT_CLOUD_SAVE_DIR, FLASH_TASK_LIMIT_MB, _INTERRUPT_POLL_SECONDS, _MAX_CONCURRENT_DOWNLOADS, _MSG_BAD_LINK, _MSG_BLACKLISTED, _MSG_BUSY, _MSG_LINK_SWITCHED, _MSG_NEED_LIST, _SEL_NUM_RE, _SEND_FILES_THRESHOLD_DEFAULT, _USER_LOCK_MAX_ENTRIES, _ZIP_MAX_MB_DEFAULT
+from .domain.constants import _BPCS_EXE_NAME, _BROWSER_UA, DEFAULT_CLOUD_SAVE_DIR, DEFAULT_USER_DIR_MODE, FLASH_TASK_LIMIT_MB, _INTERRUPT_POLL_SECONDS, _MAX_CONCURRENT_DOWNLOADS, _MSG_BAD_LINK, _MSG_BLACKLISTED, _MSG_BUSY, _MSG_LINK_SWITCHED, _MSG_NEED_LIST, _SEL_NUM_RE, _SEND_FILES_THRESHOLD_DEFAULT, _USER_LOCK_MAX_ENTRIES, USER_DIR_MODES, _ZIP_MAX_MB_DEFAULT
 from .domain.paths import _GITHUB_PROXY_FILE, PLUGIN_DATA_DIR
 from .domain.state import state
 from .utils.bpcs import _init_bpcs, login_bduss_bpcs, login_bpcs, login_cookies_bpcs, logout_bpcs, _run_bpcs
@@ -74,6 +74,15 @@ class BaiduNetdiskPlugin(Star):
         else:
             state.cloud_save_dir = DEFAULT_CLOUD_SAVE_DIR
         logger.info(f"[baidu_netdisk] cloud save dir: {state.cloud_save_dir}")
+
+        # 用户隔离子目录命名：默认哈希（网盘目录里看不到 QQ 号），raw 直接用发送者 ID（便于核查）
+        user_dir_mode = str(self.config.get("user_dir_mode", DEFAULT_USER_DIR_MODE) or "").strip().lower()
+        if user_dir_mode not in USER_DIR_MODES:
+            if user_dir_mode:
+                logger.warning(f"[baidu_netdisk] ⚠️ 非法的 user_dir_mode ({user_dir_mode})，回退默认 {DEFAULT_USER_DIR_MODE}")
+            user_dir_mode = DEFAULT_USER_DIR_MODE
+        state.user_dir_mode = user_dir_mode
+        logger.info(f"[baidu_netdisk] user dir mode: {state.user_dir_mode}")
 
         # 分享缓存：按用户分桶，谁看谁的链接互不覆盖（多人查看不同链接时不会串台）
         self._share_cache = {}
@@ -154,7 +163,7 @@ class BaiduNetdiskPlugin(Star):
             logger.info("[baidu_netdisk] bduuss 配置自动登录成功")
 
     def _cloud_dir_for(self, user_id: str) -> str:
-        """该用户的网盘转存目录：<cloud_save_dir>/<用户哈希>。
+        """该用户的网盘转存目录：<cloud_save_dir>/<用户隔离子目录>。
         按用户隔离后，下载完成的自动删除只会删掉自己的转存内容。"""
         base = (state.cloud_save_dir or DEFAULT_CLOUD_SAVE_DIR).rstrip("/")
         return f"{base}/{_user_bucket(user_id)}"

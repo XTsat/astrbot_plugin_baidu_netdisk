@@ -33,6 +33,12 @@ _USER_LOCK_MAX_ENTRIES = 200  # 用户级串行锁最多保留多少条，超出
 
 DEFAULT_CLOUD_SAVE_DIR = "/我的资源/AutoTransfer"
 
+DEFAULT_USER_DIR_MODE = "hash"  # 默认用哈希命名用户隔离子目录，不把 QQ 号等原始标识写进网盘目录名
+
+USER_DIR_MODE_RAW = "raw"  # 直接用发送者原始 ID（如 QQ 号）命名，便于在网盘里按用户核查
+
+USER_DIR_MODES = (DEFAULT_USER_DIR_MODE, USER_DIR_MODE_RAW)
+
 FLASH_TASK_LIMIT_MB = 200
 
 _ZIP_MAX_MB_DEFAULT = 10240  # 文件夹打包上限默认值（MB，10GB 对应 QQ 闪传大文件通道）；可在配置中修改，0=不限制

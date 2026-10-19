@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterator
 
 from astrbot.api import logger
 
-from ..domain.constants import _IS_WINDOWS
+from ..domain.constants import _IS_WINDOWS, USER_DIR_MODE_RAW
 from ..domain.paths import _FILE_WRITE_LOCK, _MANIFEST_LOCK, _MANIFEST_PATH, _NOTICE_LOCK, _NOTICE_MAX_CHARS, _NOTICE_MAX_PER_USER, _NOTICE_PATH
 from ..domain.state import state
 
@@ -197,10 +197,17 @@ def _schedule_local_cleanup(hour: int) -> None:
     logger.info(f"[baidu_netdisk] scheduled local cleanup at {hour}:00 daily")
 
 def _user_bucket(user_id: str) -> str:
-    """用户标识 → 转存子目录名（稳定短哈希，不把 QQ 号等原始标识写进网盘目录名）。"""
+    """用户标识 → 转存子目录名（网盘转存目录与本地镜像路径共用）。
+
+    默认 hash：稳定短哈希，不把 QQ 号等原始标识写进网盘目录名；
+    配置 user_dir_mode=raw 时直接用原始标识（如 QQ 号），便于在网盘里按用户核查。"""
     raw = str(user_id or "").strip()
     if not raw:
         return "ushared"
+    if state.user_dir_mode == USER_DIR_MODE_RAW:
+        # 这个值会拼进网盘路径与本地目录名：原样带入 `/`、`\` 会把用户写到别的层级，
+        # 所以非 [字母/数字/_/-] 一律换成 `_`；截断避免超长 ID 撑爆路径长度限制
+        return "".join(c if (c.isalnum() or c in "_-") else "_" for c in raw)[:64]
     return "u" + hashlib.blake2b(raw.encode("utf-8"), digest_size=6).hexdigest()
 
 def _iter_file_stats(root: str) -> Iterator[tuple[str, os.stat_result]]:
