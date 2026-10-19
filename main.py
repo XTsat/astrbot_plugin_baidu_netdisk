@@ -25,7 +25,7 @@ from astrbot.core.star.filter.command import GreedyStr
 from .core.concurrency import _DownloadGuard, _DuplicateDownloadError, _get_download_semaphore, _release_download_slot
 from .core.download import _config_bool, _config_int, download_from_cloud, _get_local_file_size, _next_progress, _zip_files
 from .core.panapi import list_share_content, _list_share_tree_api, _share_switch_lock, _transfer_via_api
-from .domain.constants import _BPCS_EXE_NAME, _BROWSER_UA, DEFAULT_CLOUD_SAVE_DIR, FLASH_TASK_LIMIT_MB, _INTERRUPT_POLL_SECONDS, _MAX_CONCURRENT_DOWNLOADS, _MSG_BAD_LINK, _MSG_BLACKLISTED, _MSG_BUSY, _MSG_LINK_SWITCHED, _MSG_NEED_LIST, _SEND_FILES_THRESHOLD_DEFAULT, _USER_LOCK_MAX_ENTRIES, _ZIP_MAX_MB_DEFAULT
+from .domain.constants import _BPCS_EXE_NAME, _BROWSER_UA, DEFAULT_CLOUD_SAVE_DIR, FLASH_TASK_LIMIT_MB, _INTERRUPT_POLL_SECONDS, _MAX_CONCURRENT_DOWNLOADS, _MSG_BAD_LINK, _MSG_BLACKLISTED, _MSG_BUSY, _MSG_LINK_SWITCHED, _MSG_NEED_LIST, _SEL_NUM_RE, _SEND_FILES_THRESHOLD_DEFAULT, _USER_LOCK_MAX_ENTRIES, _ZIP_MAX_MB_DEFAULT
 from .domain.paths import _GITHUB_PROXY_FILE, PLUGIN_DATA_DIR
 from .domain.state import state
 from .utils.bpcs import _init_bpcs, login_bduss_bpcs, login_bpcs, login_cookies_bpcs, logout_bpcs, _run_bpcs
@@ -158,6 +158,28 @@ class BaiduNetdiskPlugin(Star):
         self._share_cache[user_id] = {"surl": surl, "pwd": pwd, "tree": tree, "items": items}
         while len(self._share_cache) > self._SHARE_CACHE_MAX_USERS:
             self._share_cache.pop(next(iter(self._share_cache)), None)
+
+    @staticmethod
+    def _resolve_tree_selection(cached: dict, raw: str) -> tuple[str, str]:
+        """把「目录树序号」或「完整路径」解析为该分享中的路径，返回 (路径, 错误文案)。
+
+        序号来自目录树每项前面的数字（items 的 num 字段）：/pan look 重发的是同一份
+        缓存文本，因此序号在缓存被刷新前保持不变。纯数字也可能是目录/文件名（如 2025），
+        序号没命中时按路径继续解析——不命中序号不代表一定是路径，所以这里要两种都试。"""
+        sel = (raw or "").strip().strip("/")
+        if not sel:
+            return "", "缺少序号或路径（可先 /pan <链接> 查看目录）"
+        m = _SEL_NUM_RE.match(sel)
+        if not m:
+            return sel, ""
+        num = int(m.group(1))
+        items = cached.get("items") or []
+        for it in items:
+            if it.get("num") == num:
+                return str(it.get("path") or ""), ""
+        if any(it.get("path") == sel for it in items):
+            return sel, ""
+        return "", f"目录中没有序号 {num}，请先 /pan look 查看目录后用序号下载"
 
     def _user_has_active_download(self, user_id: str) -> bool:
         """该用户是否有下载在途（含已受理但尚未登记下载的窗口，见 _switch_claims）。"""
@@ -700,18 +722,19 @@ class BaiduNetdiskPlugin(Star):
             return result["error"]
         return (f"{result['text']}\n\n"
                 f"（环境信息：网盘转存目录为 {self._cloud_dir_for(uid)}，本地下载目录为 {state.download_dir}，"
-                f"后续转存/下载结果都在这两个目录下）")
+                f"后续转存/下载结果都在这两个目录下。目录树每项前面的数字是序号，"
+                f"下载/转存时可直接把序号传给 pan_download_dir / pan_transfer）")
 
     @filter.llm_tool(name="pan_download_dir")
     async def pan_download_dir(self, event: AstrMessageEvent, folder_path: str, link: str = "", pwd: str = "") -> str:
-        """下载百度网盘分享中的文件夹或单个文件。用户说"下载xxx文件夹"、"下载xxx里面的xxx文件夹"、"下载xxx这个文件"时调用。
-        folder_path 必须与 pan_list 返回的目录树中显示的路径完全一致（从分享根目录第一层开始，如 "初中资料/2025万唯"），不要自创或省略层级。如果还没查看过目录树，先调用 pan_list。
+        """下载百度网盘分享中的文件夹或单个文件。用户说"下载第3个"、"下载xxx文件夹"、"下载xxx里面的xxx文件夹"、"下载xxx这个文件"时调用。
+        folder_path 可以传目录树每项前面的序号（如 "3"），也可以传与 pan_list 返回的目录树中显示的路径完全一致的路径（从分享根目录第一层开始，如 "初中资料/2025万唯"），不要自创或省略层级。如果还没查看过目录树，先调用 pan_list。
         工具只转存选中项（需要网盘剩余空间大于该项大小）然后下载。若返回"空间不足"等错误，如实告诉用户原因，并建议挑选更小的文件/文件夹分批下载。
         本工具只负责受理，调用后立即返回「已开始」：插件在后台转存并下载，完成（或失败）后会把结果与文件直接发给用户。
         因此不要重复调用本工具，也不要自己编造下载结果或本地路径；若后台回报「空间不足」等错误，如实转告用户并建议挑选更小的文件/文件夹分批下载。
 
         Args:
-            folder_path(string): 目录树中显示的文件夹或文件路径，如 "初中资料" 或 "初中资料/2025万唯"
+            folder_path(string): 目录树每项前面的序号（如 "3"）或目录树中显示的文件夹/文件路径（如 "初中资料" 或 "初中资料/2025万唯"）
             link(string): 百度网盘分享链接（可选，如未查看过目录则需提供；也可传整段分享文案，会自动识别链接与提取码）
             pwd(string): 提取码（可选）
         """
@@ -719,13 +742,20 @@ class BaiduNetdiskPlugin(Star):
             return _MSG_BLACKLISTED
 
         if not folder_path.strip():
-            return "缺少 folder_path 参数（目录树中显示的文件夹或文件路径）"
+            return "缺少 folder_path 参数（目录树中显示的序号或路径）"
 
         surl, pwd, uid, err, cached = self._resolve_tool_link(event, link, pwd)
         if err:
             return err
 
-        dl_key = f"tool:pan_download_dir:{uid}:{folder_path}"
+        # 传了链接时序号属于「还没列出来」的新分享，不能按旧缓存解析；
+        # 交给后台任务在列目录之后再解析（见 _job_download_and_send）
+        if not link:
+            folder_path, sel_err = self._resolve_tree_selection(cached, folder_path)
+            if sel_err:
+                return sel_err
+
+        dl_key = f"tool:pan_download_dir:{uid}:{surl or cached['surl']}:{folder_path}"
         if dl_key in self._active_downloads or dl_key in self._pending_jobs:
             logger.warning(f"[baidu_netdisk] ⚠️ pan_download_dir: duplicate blocked: {dl_key}")
             return _MSG_BUSY
@@ -769,14 +799,14 @@ class BaiduNetdiskPlugin(Star):
     @filter.llm_tool(name="pan_transfer")
     async def pan_transfer(self, event: AstrMessageEvent, link: str = "", pwd: str = "", path: str = "") -> str:
         """把百度网盘分享中的文件或文件夹转存到自己的网盘（不下载到本地）。用户说"转存一下"、"存到我的网盘"、"先转存"时调用。
-        path 传 pan_list 目录树中显示的路径则只转存该项（需要网盘剩余空间大于该项大小）；不传 path 则转存分享根目录的全部内容（特大分享会因空间不足失败）。
+        path 传目录树每项前面的序号（如 "3"）或 pan_list 目录树中显示的路径则只转存该项（需要网盘剩余空间大于该项大小）；不传 path 则转存分享根目录的全部内容（特大分享会因空间不足失败）。
         本工具只负责受理，调用后立即返回「已开始」：插件在后台完成转存，并把转存结果（含完整网盘路径）直接发给用户。
         因此不要重复调用本工具，也不要自己编造转存结果或网盘路径。
 
         Args:
             link(string): 百度网盘分享链接（可选，如未查看过目录则需提供；也可传整段分享文案，会自动识别链接与提取码）
             pwd(string): 提取码（可选）
-            path(string): 要转存的文件夹或文件在目录树中的路径（可选，不传则转存全部）
+            path(string): 要转存的文件夹或文件在目录树中的序号或路径（可选，不传则转存全部）
         """
         if self._is_blacklisted(event):
             return _MSG_BLACKLISTED
@@ -785,8 +815,14 @@ class BaiduNetdiskPlugin(Star):
         if err:
             return err
 
+        if path and not link:
+            # 序号按受理时的缓存解析；传了链接则交给后台任务列目录后再解析（理由同 pan_download_dir）
+            path, sel_err = self._resolve_tree_selection(cached, path)
+            if sel_err:
+                return sel_err
+
         # 大分享转存同样可能超过工具超时：交给后台任务，结果由它自己发给用户
-        transfer_key = f"tool:pan_transfer:{uid}:{path}"
+        transfer_key = f"tool:pan_transfer:{uid}:{surl or cached['surl']}:{path}"
         if transfer_key in self._pending_jobs:
             logger.warning(f"[baidu_netdisk] ⚠️ pan_transfer: duplicate blocked: {transfer_key}")
             return "⏳ 该转存正在进行中，请稍候..."
@@ -834,12 +870,21 @@ class BaiduNetdiskPlugin(Star):
         下载该分享的全部内容。link 为空时改用 cached_surl（工具受理那一刻的缓存快照），
         本任务不重读缓存——受理与执行之间用户可能已查看别的链接，重读会按那份分享里的
         同名文件转存下载。完成/失败的消息由本任务直接发给用户。"""
-        whole_share = not folder_path
-        label = folder_path or "全部文件"
         try:
             surl = await self._resolve_job_link(event, uid, link, pwd, cached_surl, switch_checked)
             if not surl:
                 return
+            # 序号只在「本任务自己刚列出的目录树」里解析：link 非空时上一步已刷新缓存，
+            # 此时读缓存才拿得到这棵树里的序号（受理时的缓存可能属于别的分享）。
+            # link 为空说明工具受理时已用同一份缓存解析过，不能再解一次——路径恰好是
+            # 纯数字文件名（如 "3"）时会被误当成序号（工具也是同样的条件，见 pan_download_dir）
+            if folder_path and link:
+                folder_path, sel_err = self._resolve_tree_selection(self._cache_get(uid), folder_path)
+                if sel_err:
+                    await self._notify_user(event, f"❌ {sel_err}")
+                    return
+            whole_share = not folder_path
+            label = folder_path or "全部文件"
             try:
                 guard, queued = await self._begin_download(uid, dl_key)
             except _DuplicateDownloadError:
@@ -900,6 +945,12 @@ class BaiduNetdiskPlugin(Star):
                 return
             cloud_dir = self._cloud_dir_for(uid)
             if path:
+                # 序号在列完目录后再解析；link 为空时工具已解析过（理由同 _job_download_and_send）
+                if link:
+                    path, sel_err = self._resolve_tree_selection(self._cache_get(uid), path)
+                    if sel_err:
+                        await self._notify_user(event, f"❌ {sel_err}")
+                        return
                 tr = await asyncio.to_thread(self._ensure_transferred_sync, path, uid, surl)
                 if "error" in tr:
                     await self._notify_user(event, f"❌ {tr['error']}")
@@ -1173,15 +1224,15 @@ class BaiduNetdiskPlugin(Star):
         # 之前发送失败的结果在这里补发：机器人掉线时用户收不到任何提示，只能等他下次说话
         for notice in _notice_take(uid):
             yield event.plain_result(f"📬 之前有一条结果没能送达，补发如下：\n{notice}")
-        dl_key = f"{uid}:{str(args).strip()}"
         parts = [p for p in str(args).split() if p]
         if not parts or parts[0] == "help":
             help_lines = [
                 "用法:",
-                "/pan <链接> [密码]  查看目录树",
+                "/pan <链接> [密码]  查看目录树（每项带序号）",
                 "💡 可直接粘贴整段分享文案（含“链接:”与“提取码:”），自动识别链接与提取码",
-                "/pan look  重新查看目录树",
-                "/pan down <文件或文件夹路径>  下载文件夹或文件（自动识别类型）",
+                "/pan look  重新查看目录树（序号不变）",
+                "/pan down <序号或路径>  下载文件夹或文件（自动识别类型）",
+                "💡 目录树每项前面的数字就是序号，可直接 /pan down 3 下载第 3 项",
                 "（以下命令仅管理员可用，因为它们会改变全群共用的百度账号与运行工具）",
                 "/pan login  登录/退出统一入口（发送 /pan login 查看登录菜单）",
                 "/pan pcs  下载/更新 BaiduPCS-Go 工具（直连失败时自动挑选可用加速镜像）",
@@ -1304,16 +1355,21 @@ class BaiduNetdiskPlugin(Star):
             return
 
         if parts[0] == "down":
-            # 下载文件夹或单个文件（自动识别类型）；使用本用户缓存的链接
+            # 下载文件夹或单个文件（自动识别类型）；使用本用户缓存的链接与目录树
             cached = self._cache_get(uid)
             if not cached["surl"]:
                 yield event.plain_result("请先使用 /pan <链接> [密码] 查看目录")
                 return
             if len(parts) < 2:
-                yield event.plain_result("用法: /pan down <文件或文件夹路径>（自动识别类型）")
+                yield event.plain_result("用法: /pan down <序号或路径>（先 /pan <链接> 查看目录）")
                 return
-            # 路径可能含空格，拼回完整参数
-            dl_path = " ".join(parts[1:])
+            # 路径可能含空格，拼回完整参数；纯数字（如 3）按目录树序号解析
+            dl_path, sel_err = self._resolve_tree_selection(cached, " ".join(parts[1:]))
+            if sel_err:
+                yield event.plain_result(f"❌ {sel_err}")
+                return
+            # 用解析后的路径做去重键：同一项无论是用序号还是完整路径发起的，都视作同一个下载
+            dl_key = f"{uid}:down:{dl_path}"
             logger.info(f"[baidu_netdisk] on_pan down: dl_path={dl_path}, progress_enabled={self._progress_enabled}")
             # 同一用户的下载串行执行 + 全局并发上限：锁、通道、去重键都由 worker 结束时释放，
             # 本协程被取消（插件重载、框架关闭命令生成器）也不会提前放锁（见 _DownloadGuard）

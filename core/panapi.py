@@ -7,7 +7,7 @@ import time
 
 from astrbot.api import logger
 
-from ..domain.constants import _BPCS_LS_RE, _MSG_NEED_LOGIN, _TREE_DISPLAY_LIMIT_PER_DIR, _TREE_MAX_ITEMS
+from ..domain.constants import _BPCS_LS_RE, _MSG_NEED_LOGIN, _TREE_DISPLAY_LIMIT_PER_DIR, _TREE_MAX_ITEMS, _TREE_NUM_HINT
 from ..utils.bpcs import _build_pan_session
 from ..utils.size import _format_size
 
@@ -315,7 +315,7 @@ def _list_share_tree_api(surl: str, pwd: str) -> dict:
     bdstoken, short = pf["bdstoken"], pf["short"]
 
     lines, items = [], []
-    state = {"truncated": False}
+    state = {"truncated": False, "next_num": 0}
 
     def _walk(dir_rel: str, api_dir: str, depth: int) -> None:
         if len(items) >= _TREE_MAX_ITEMS:
@@ -356,29 +356,35 @@ def _list_share_tree_api(surl: str, pwd: str) -> dict:
                 break
             is_dir = str(f.get("isdir")) == "1"
             rel = f"{dir_rel}/{name}" if dir_rel else name
-            # 无论是否显示都记入 items：/pan down <路径> 靠这份清单解析路径，
-            # 只记显示出来的会让第 61 项之后的文件既看不到也下不了
-            items.append({"path": rel, "name": name,
-                          "size": "-" if is_dir else str(f.get("size", 0)),
-                          "is_dir": is_dir, "fs_id": str(f.get("fs_id"))})
+            # 无论是否显示都记入 items：/pan down <序号或路径> 靠这份清单解析，
+            # 只记显示出来的会让第 61 项之后的文件既看不到也下不了。
+            # num=0 表示未显示（不占序号），只能按完整路径下载
+            item = {"path": rel, "name": name,
+                    "size": "-" if is_dir else str(f.get("size", 0)),
+                    "is_dir": is_dir, "fs_id": str(f.get("fs_id")), "num": 0}
+            items.append(item)
             if shown >= _TREE_DISPLAY_LIMIT_PER_DIR:
                 # 超出显示上限：不再显示、也不再递归展开（该项仍可用 /pan down 按路径下载）
                 omitted += 1
                 continue
             shown += 1
+            state["next_num"] += 1
+            num = state["next_num"]
+            item["num"] = num
             if is_dir:
-                lines.append(f"{prefix}📁 {name}/")
+                lines.append(f"{prefix}{num}. 📁 {name}/")
                 _walk(rel, f.get("path") or "", depth + 1)
             else:
-                lines.append(f"{prefix}📄 {name}  ({_format_size(str(f.get('size', 0)))})")
+                lines.append(f"{prefix}{num}. 📄 {name}  ({_format_size(str(f.get('size', 0)))})")
         if omitted:
-            lines.append(f"{prefix}… 本目录另有 {omitted} 项未显示（可用 /pan down 加完整路径下载）")
+            lines.append(f"{prefix}… 本目录另有 {omitted} 项未显示（未显示项无序号，可用 /pan down 加完整路径下载）")
 
     _walk("", "", 0)
     if not lines:
         return {"error": "目录为空或获取失败"}
     if state["truncated"]:
-        lines.append(f"（目录过多，仅列出前 {_TREE_MAX_ITEMS} 项；其余内容可用 /pan down 加完整路径下载）")
+        lines.append(f"（目录过多，仅列出前 {_TREE_MAX_ITEMS} 项；其余内容无序号，可用 /pan down 加完整路径下载）")
+    lines.append(_TREE_NUM_HINT)
     return {"text": "\n".join(lines), "items": items}
 
 def list_share_content(surl: str, pwd: str = "") -> dict:

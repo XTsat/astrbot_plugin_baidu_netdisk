@@ -91,6 +91,10 @@ _PWD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 目录树序号：允许「3」「第3个」「3.」「#3」等写法；不带尾随内容，
+# 避免把「3.mp4」这类数字开头的文件名误当成序号
+_SEL_NUM_RE = re.compile(r'^\s*(?:第\s*)?#?\s*(\d+)\s*个?\s*[.、:：]?\s*$')
+
 _SIZE_UNITS: tuple[tuple[str, int], ...] = (
     ("TB", 1024 ** 4), ("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024),
 )
@@ -104,7 +108,9 @@ _BPCS_LS_RE = re.compile(
 
 _TREE_DISPLAY_LIMIT_PER_DIR = 60  # 目录树文本中每个目录最多显示多少项（避免消息过长）
 
-_TREE_MAX_ITEMS = 300  # 目录树最多记录多少项；/pan down <路径> 靠这份清单解析路径
+_TREE_MAX_ITEMS = 300  # 目录树最多记录多少项；/pan down <序号或路径> 靠这份清单解析
+
+_TREE_NUM_HINT = "💡 每项前面的数字是序号，下载时可直接用序号选择"
 
 _PRECOMPRESSED_EXT = {
     # 视频
