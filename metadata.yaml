@@ -2,7 +2,7 @@ name: astrbot_plugin_baidu_netdisk
 display_name: 百度网盘下载
 short_desc: 百度网盘分享下载插件
 desc: 百度网盘分享自动下载并发送。登录后全员都可使用。
-version: 2.1.1
+version: 2.1.2
 author: XTsat
 repo: https://github.com/XTsat/astrbot_plugin_baidu_netdisk
 social_link: https://xtsat.cc.cd/posts/202607031752.html
