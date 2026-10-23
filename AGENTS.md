@@ -5,8 +5,9 @@
 >
 > 项目：`astrbot_plugin_baidu_netdisk`（百度网盘下载）
 >
-> **来源**：本文件由 [agent-templates](https://github.com/XTsat/agent-templates) 的 `templates/astrbot-plugin/AGENTS.md` 派生，并按本项目实际情况回填；最新版见该仓库 `main` 分支。
-> 用户说「更新 AGENTS」时按此流程：① 拉取来源模板最新版 → ② 与本地逐节比对 → ③ 合并（保留本项目已回填的插件名、命令前缀、目录结构与项目特有约定）→ ④ 展示 diff 与改动清单，等用户确认后再落盘。**禁止整文件覆盖**。
+> **模板版本**：v0.1.0（2026-10-21）—— 本行标记本文件对应的 `astrbot-plugin` 模板版本。从上游合并到新版本时，把本行更新为合并到的版本。
+> **来源**：本文件由 [agent-templates](https://github.com/XTsat/agent-templates) 的 `templates/astrbot-plugin/AGENTS.md` 派生（模板版本 v0.1.0），并按本项目实际情况回填；最新版见该仓库 `main` 分支。
+> 用户说「更新 AGENTS」时按此流程：① 打开来源仓库该模板的 `AGENTS.md`，比对头部「模板版本」与本地是否一致——一致说明已是最新，直接结束，不必拉取逐节比对 → ② 不一致才拉取来源模板最新版 → ③ 与本地逐节比对 → ④ 合并（保留本项目已回填的插件名、命令前缀、目录结构与项目特有约定，见 2.3）→ ⑤ 展示 diff 与改动清单，等用户确认后再落盘，并把头部「模板版本」同步改为合并到的版本。**禁止整文件覆盖**。
 
 ---
 
@@ -78,6 +79,10 @@ AstrBot 插件有两种主流架构风格，**新建项目时二选一，并在�
 | **单文件** | 逻辑简单（< 1500 行） | `astrbot_plugin_msg_forward_cc`、`astrbot_plugin_model_status` |
 | **分层多文件** | 逻辑复杂，需模块化 | `astrbot_plugin_help_panel_typst`（main.py → core → utils → domain） |
 
+**单文件风格**：
+- 所有逻辑在 `main.py` 一个文件中，通过注释分隔条组织：`# 内部工具方法 → # Web API → # 数据持久化 → # 执行与调度 → # 聊天命令 → # 生命周期`
+- 新增方法按职责放入对应分区
+
 **本项目采用分层多文件风格**：逻辑已从单文件（约 3800 行）按本节规范拆分，`main.py` 现约 1450 行，只留插件入口。
 
 **分层多文件风格（本项目现行）**：
@@ -116,7 +121,7 @@ AstrBot 插件有两种主流架构风格，**新建项目时二选一，并在�
 1. **分层多文件风格**：逻辑已从单文件拆为 `main.py → core → utils → domain`（见 2.2）。拆分只解决文件体积，不豁免 2.2 的「同一逻辑只能有一处实现」。`main.py` 保留全部装饰器方法，不拆 mixin；运行期可变状态集中在 `domain/state.py`，不用 `global` 跨模块改值。
 2. **仅维护中文 README**：本项目**只有 `README.md`，未创建 `README_en.md`**（用户已确认）。7.2 中关于英文版的要求在创建英文版之前不适用；新增文档章节时只落中文版，不要凭空新建英文文件。
 3. **外部依赖 BaiduPCS-Go**：插件不内置该二进制，按平台自动下载（Windows / Linux / macOS，x64 / arm64），国内镜像兜底仅 Windows 版；相关行为变更必须同步 README 与 CHANGELOG。
-4. **插件数据目录**：`data/plugin_data/astrbot_plugin_baidu_netdisk/`（经 `StarTools.get_data_dir()` 解析，另有旧版 AstrBot 兼容回退）。
+4. **插件数据目录**：`data/plugin_data/astrbot_plugin_baidu_netdisk/`（经 `StarTools.get_data_dir()` 解析，另有旧版 AstrBot 兼容回退）。**BaiduPCS-Go 登录凭证（`pcs_config.json`）固定存放在此目录**，随 AstrBot 数据卷持久化，Docker 重建容器不丢登录态；凭证位置不受 `BAIDUPCS_GO_CONFIG_DIR` 环境变量影响，从旧版本升级时插件会自动把旧位置的凭证迁移过来。
 
 ---
 
@@ -164,6 +169,8 @@ class BaiduNetdiskPlugin(Star):
     ) -> AsyncGenerator[MessageEventResult, None]:
         yield event.plain_result("帮助信息")
 ```
+
+> `@register` 的最后一个参数只是注册信息，**不是版本源**。插件版本以 `metadata.yaml` 的 `version` 为准（见 7.1「版本号」）；日常改动不递增；准备发布时改这一处，并按 7.1 把 README 徽章等辅助位置同步到同一版本号。
 
 ### 4.2 命名约定
 
@@ -305,7 +312,7 @@ async def on_message(
 #### 流程
 
 - 日常改动先记在 `## [Unreleased]` 段（顶部固定）。**发版时**再把内容移动到带版本号的新段。
-- 多个不相关改动在同一工作周期内，各自独立记入 `[Unreleased]`，**不要**合并为一条。
+- **先记后合**：记录阶段同一工作周期内的改动各自独立记入 `[Unreleased]`（同一功能的多处调整也先各记一条，避免遗漏）；提交或发版前的整理阶段统一过一遍 `[Unreleased]`，把描述同一件事的多条合并成一条，不相关改动保持独立（判断标准：用户会不会把它当成同一件事，细则见下方「写作视角」）。
 - **发版日期**：版本段日期 `(YYYY-MM-DD)` 填**当前日期**（以发版当天的系统时间为准，例如 `2026-09-22`）。
 
 #### 格式
@@ -348,6 +355,9 @@ CHANGELOG 的读者是**插件使用者**（服务器管理员、群成员），
 - **禁止内部实现细节**：类名/函数名、方法拆分、数据结构、算法、缓存与并发策略、日志埋点、依赖升级、重构过程，一律不写。
 - **禁止出现代码标识符与文件路径**（如 `_rebuild_media_component`、`core/worker.py`）；用户直接接触的**命令名**、**配置项 key** 除外。
 - **无用户感知的改动不记入 CHANGELOG**：纯内部重构、格式化、注释与测试调整等，写了用户也读不懂、也用不上。
+- **只写相对上一版的变化**：每条回答「这个版本和用户手上的版本比，变了什么」，只讲差异；不复述仍然有效的旧功能，不写「继续优化」「体验更好」这类没有信息量的空话。
+- **同一个变化合并成一条**：同一功能的多处调整、跨多个提交的同一件事，在提交或发版前的整理阶段合并为一条；同一内容不要在不同分类或不同版本段里重复出现。
+- **一句话说清改了什么**：按「做了什么 + 用户得到什么」写完，不加背景、动机与实现过程，也不用复杂形容；用户扫一眼就能对上自己关心的功能。
 - 判断标准：使用者读完一条，能决定「要不要升级、升级后有什么不同」。
 
 正反例：
@@ -362,17 +372,17 @@ CHANGELOG 的读者是**插件使用者**（服务器管理员、群成员），
 - ❌ 修复 `as_completed` 回调未捕获 `asyncio.TimeoutError` 导致的 `finally` 泄漏
 ```
 
-#### 版本号联动
+#### 版本号（准备发布时才确认）
 
-涉及功能新增/删除、行为变化、配置项变化时，**三处同步递增**：
+- **日常开发不碰版本号**：只往 `[Unreleased]` 追加条目，`metadata.yaml` 的 `version` 保持原值；每个功能、每个修复各自是一次独立提交，提交里不带版本号变更，也不改辅助位置的版本字样。
+- **准备发布时才确认并递增一次**：一次发版汇总了多个独立的功能/修复提交，等合并到指定版本、把 `[Unreleased]` 内容移入 `## vX.Y.Z (YYYY-MM-DD)` 的同一次操作里，才确认版本号（SemVer 见 8.2）、写进下方的**唯一版本源文件**、把辅助位置同步成同一个版本号并打 `git tag vX.Y.Z`。**不能每改一点就递增**——否则版本号会随提交次数突进，与实际发布节奏脱节。
+- **唯一版本源**：`metadata.yaml` 的 `version` 字段（`vX.Y.Z` 格式，AstrBot 读取的插件版本）。需要「插件版本」时一律以它为准。
 
-| 文件 | 位置 |
+| 版本源文件 | 位置 |
 |------|------|
 | `metadata.yaml` | `version` 字段（`vX.Y.Z` 格式） |
-| `CHANGELOG.md` | 发版时从 `[Unreleased]` 移入 `## vX.Y.Z (YYYY-MM-DD)` |
-| `README.md` | 版本徽章（本项目徽章取 git tag，发版打 tag 后自动更新） |
 
-纯修复/内部重构可只更新 `[Unreleased]` 条目，不递增版本号。
+下列位置属于**辅助信息，不是版本源**，不决定版本号（需要「插件版本」时以 `metadata.yaml` 为准）：`main.py` 中 `@register` 传入的版本号、`README.md` 的版本徽章与正文版本字样。**日常提交不动它们；准备发布时必须逐个同步到同一个新版本号**，不得残留旧版本号或自相矛盾的版本字样。也不要新增此类重复版本号——需要展示版本时从 `metadata.yaml` 读取，不手写。
 
 #### 多会话并行开发
 
@@ -428,7 +438,7 @@ README 的读者是**插件使用者**（服务器管理员、群成员），不
 
 命名规则：
 - **中文版 h1**：直接取 `metadata.yaml` 的 `display_name` 字段（本项目为「百度网盘下载」）。
-- **英文版 h1**：取插件名 `astrbot_plugin_xxx` 中的 `xxx` 部分，拆分为单词后每个首字母大写。例如 `astrbot_plugin_reread` → `Reread`；`astrbot_plugin_model_status` → `Model Status`。
+- **英文版 h1**：取插件名 `astrbot_plugin_xxx` 中的 `xxx` 部分，拆分为单词后每个首字母大写。例如 `astrbot_plugin_reread` → `Reread`；`astrbot_plugin_model_status` → `Model Status`；`astrbot_plugin_help_panel_typst` → `Help Panel Typst`。
 - **desc**：中文版用 `metadata.yaml` 的 `desc` 字段；英文版做地道翻译。
 - **标签（tags）**：取自 `metadata.yaml` 的 `tags` 字段（若有），用 `&nbsp;&nbsp;` 分隔。中文版用中文标签，英文版用英文标签。
 
@@ -499,7 +509,11 @@ README 正文严格按以下 4 大板块组织，但不强制使用 `##` 标题�
 
 - 提交信息遵循 **Conventional Commits**：`<type>(<scope>): <中文短句式 subject>`（如 `feat: 开放颜色配置项`、`fix: 失败发送通知补重试`、`docs: 补充配置说明`）
 - **禁止**将未完成的功能、多轮迭代的中间状态、被废弃的方案写进提交信息
-- **提交前必须先向用户展示改动内容和提交标题**，等用户确认后再执行 commit；展示内容至少包含：待提交文件清单、改动概要（如 `git diff --stat`）、提交标题；涉及推送时另附提交 hash 与目标分支
+- **提交前必须先向用户展示，等用户确认后再执行 commit**，展示内容缺一不可：
+  - 待提交文件清单
+  - 改动概要（如 `git diff --stat`）
+  - **提交标题，尽量给 2–3 个候选**（同一改动的不同侧重点：做了什么 / 为什么改 / 是否带 scope），逐条注明侧重供用户挑选并标出推荐项；确实只有一种合理写法时才只给一个
+  - 用户选定标题（或自拟）后才 commit；涉及推送时另附提交 hash、提交信息、目标分支与改动概要
 - 推荐顺序：完成功能代码 → 跑通验证 → 更新 CHANGELOG 与 README → 提交
 - 文档更新与代码改动**在同一提交中完成**（不单独拆「补文档」提交）
 - 只有用户明确要求时才 commit / push
@@ -513,8 +527,8 @@ README 正文严格按以下 4 大板块组织，但不强制使用 `##` 标题�
 ### 8.2 版本号规范
 
 - 采用 **SemVer**：新功能 → `minor` 递增；bug 修复/小改进 → `patch` 递增
-- `metadata.yaml` version 与 `CHANGELOG.md` 最新版本必须一致
-- 发版时打 `git tag vX.Y.Z`，tag 推送同样需用户确认
+- **只在准备发布时递增**（规则见 7.1）：单个功能/修复提交不碰版本号；一次发版汇总多个独立提交、合并到指定版本时才确认版本号，改 `metadata.yaml` 的 `version`，并把 `@register`、README 徽章等辅助位置同步到同一版本号——逐次递增会让版本号突进
+- 发版一致性：`metadata.yaml` version = CHANGELOG 新版本段号 = `git tag vX.Y.Z`，tag 推送同样需用户确认
 
 ### 8.3 测试与验证
 
@@ -537,10 +551,10 @@ README 正文严格按以下 4 大板块组织，但不强制使用 `##` 标题�
 - [ ] 可变状态：新增的运行期可变状态放在 `domain/state.py`，未跨模块用 `global` 改值
 - [ ] 注释：只写 non-obvious reason，无残留中间状态、无被注释掉的旧代码
 - [ ] 日志：`[baidu_netdisk]` 前缀，异常分类记录，无空 catch
-- [ ] CHANGELOG：`[Unreleased]` 已追加条目，条目面向用户（无内部实现细节），保留了他人的既有记录
+- [ ] CHANGELOG：`[Unreleased]` 已追加条目，**只写相对上一版的变化**、同一变化已合并为一条（无重复条目），条目面向用户（无内部实现细节、无复杂形容即可看懂），保留了他人的既有记录
 - [ ] README：涉及用户可见变更时已同步更新，且面向用户书写（无实现原理与内部细节）
-- [ ] 版本号：`metadata.yaml` 与 `CHANGELOG` 最新版本一致
+- [ ] 版本号：日常任务不递增版本号；仅发版任务改 `metadata.yaml` 的 `version`（与 CHANGELOG 新版本段、tag 一致），并把 `@register`、README 徽章等辅助位置同步到同一版本号
 - [ ] 配置：新增配置项已在 `_conf_schema.json` 和代码中同步
 - [ ] 提交信息：Conventional Commits 格式（`type: 中文短句式`）
-- [ ] 提交/推送：已取得用户对本次改动的明确确认（一次性授权，未沿用上一轮）
+- [ ] 提交前展示：已给出待提交文件清单、`git diff --stat`、2–3 个候选提交标题（逐条注明侧重并标出推荐项），并取得用户对本次改动的明确确认（一次性授权，未沿用上一轮）
 - [ ] 本地测试：`cd .. && python -c "import astrbot_plugin_baidu_netdisk.main"` 无报错（见 8.3）
