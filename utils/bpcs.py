@@ -314,8 +314,15 @@ def login_bpcs(username: str, password: str, allow_insecure_tls: bool = False) -
         result = _bpcs_login_result(text, "", proc.returncode,
                                     "/pan login 2/pwd (stdin)", with_output=True)
         if "error" not in result:
-            return result
-        logger.info(f"[baidu_netdisk] stdin login 未成功，回退参数方式: rc={proc.returncode}")
+            # BPCS 的交互登录依赖终端（liner），在无 TTY 的管道下不会读取输入，
+            # 却可能以退出码 0 结束（实测输出 "liner: function not supported in this terminal"）。
+            # 只凭退出码/输出会误判成功，必须再校验凭证真的写入配置。
+            if _config_has_credentials():
+                return result
+            state.bpcs_inited = False  # 上方 _bpcs_login_result 已误置 True，复位
+            logger.warning(f"[baidu_netdisk] stdin 登录未实际写入凭证（疑似无终端交互），回退参数方式: {text.strip()[:120]}")
+        else:
+            logger.info(f"[baidu_netdisk] stdin login 未成功，回退参数方式: rc={proc.returncode}")
     except Exception as e:
         logger.warning(f"[baidu_netdisk] ⚠️ stdin login 异常，回退参数方式: {e}")
 
@@ -323,8 +330,14 @@ def login_bpcs(username: str, password: str, allow_insecure_tls: bool = False) -
     out, err, code = _run_bpcs(
         ["login", f"-username={username}", f"-password={password}"], timeout=60
     )
-    return _bpcs_login_result(out, err, code, "/pan login 2/pwd",
-                              err_re=_LOGIN_ERR_RE_PWD, with_output=True)
+    result = _bpcs_login_result(out, err, code, "/pan login 2/pwd",
+                                err_re=_LOGIN_ERR_RE_PWD, with_output=True)
+    # 参数式同样以「凭证落盘」为准，防止 BPCS 输出迷惑性成功信息
+    if "error" not in result and not _config_has_credentials():
+        state.bpcs_inited = False  # 上方 _bpcs_login_result 已误置 True，复位
+        text = ((out or "") + chr(10) + (err or "")).strip()
+        return {"error": f"登录后未能在配置中找到凭证（退出码 {code}）: {text[:120]}"}
+    return result
 
 def logout_bpcs(allow_insecure_tls: bool = False) -> dict:
     """退出 BaiduPCS-Go 当前登录的百度帐号，清除本地凭证。"""
@@ -372,6 +385,15 @@ def _first_bpcs_user(cfg: dict) -> dict:
             if isinstance(u, dict):
                 return u
     return {}
+
+def _config_has_credentials() -> bool:
+    """当前账号在配置里是否已有可用凭证（cookies 或 bduss）。
+
+    登录流程（尤其账密交互登录）以它作为「是否真正落盘」的判据：BPCS 在
+    无 TTY 环境下可能退出码 0 却没写入任何用户，仅凭子进程输出去报成功
+    会把「没登录上」说成「登录成功」。"""
+    user = _first_bpcs_user(_load_bpcs_config(quiet=True) or {})
+    return bool(user.get("cookies") or user.get("bduss"))
 
 def _apply_baidu_cookies(sess: _req.Session, cookies_str: str) -> None:
     """把 `k=v; k2=v2` 形式的 cookie 串逐个装进 session。
