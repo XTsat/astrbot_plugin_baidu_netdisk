@@ -65,7 +65,9 @@ _MSG_BPCS_UNAVAILABLE = (
 
 _LOGIN_ERR_RE = r"错误代码:\s*\d+[^\n]{0,60}|[\u4e00-\u9fa5]{2,20}[:：]?\s*[^\n]{0,60}"
 
-_LOGIN_ERR_RE_PWD = r"[\u4e00-\u9fa5]{2,20}[:：]?\s*[0-9a-zA-Z\u4e00-\u9fa5 ,.()]+"
+# 字符类需含 : 与中文标点：百度错误消息如「错误代码: 50052, 消息: 系统繁忙，请稍候再试(50052)」，
+# 缺了会截断在第一个冒号处，用户只看到半句
+_LOGIN_ERR_RE_PWD = r"[\u4e00-\u9fa5]{2,20}[:：]?\s*[0-9a-zA-Z\u4e00-\u9fa5 ,.()：:，。；!！?？、]+"
 
 _BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
