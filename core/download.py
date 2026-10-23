@@ -9,7 +9,7 @@ from astrbot.api import AstrBotConfig, logger
 
 from ..domain.constants import _BPCS_EXE_NAME, BPCS_PATH, DEFAULT_CLOUD_SAVE_DIR, _DOWNLOAD_HARD_CAP_SECONDS, _PARTIAL_GRACE_SECONDS, _PRECOMPRESSED_EXT
 from ..domain.state import state
-from ..utils.bpcs import _get_account_folder, _run_bpcs
+from ..utils.bpcs import _bpcs_env, _get_account_folder, _run_bpcs
 from ..utils.fs import _collect_files_under, _collect_new_files, _is_inside_download_dir, _manifest_add, _path_in_bucket, _snapshot_local_files, _validate_remote_path
 from ..utils.size import _parse_size_bytes, _size_matches
 from .panapi import _parse_ls_line
@@ -175,7 +175,7 @@ def download_from_cloud(cloud_path: str, max_mb: int = 0, progress_queue: "queue
         proc = subprocess.Popen(
             [BPCS_PATH, "download", full_path, "--ow"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE
+            stdin=subprocess.PIPE, env=_bpcs_env()
         )
         # 预写一个 y 应答（防个别 BPCS 版本仍弹覆盖确认），但**不要手动 close stdin**：
         # Python 3.12 的 communicate() 会对已关闭的 stdin 做内部 flush，

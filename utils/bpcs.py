@@ -11,6 +11,7 @@ import threading
 from astrbot.api import logger
 
 from ..domain.constants import _BPCS_EXE_NAME, BPCS_PATH, _BROWSER_UA, _IS_WINDOWS, _LOGIN_ERR_RE, _LOGIN_ERR_RE_PWD, _MSG_BPCS_UNAVAILABLE
+from ..domain.paths import PLUGIN_DATA_DIR
 from ..domain.state import state
 from .fs import _atomic_write, _atomic_write_json
 from .github import _auto_download_bpcs, _ensure_bpcs_exe
@@ -18,11 +19,21 @@ from .github import _auto_download_bpcs, _ensure_bpcs_exe
 
 _bpcs_lock = threading.Lock()
 
+def _bpcs_env() -> dict:
+    """BaiduPCS-Go 子进程的补充环境变量。
+
+    凭证统一放在插件数据目录（见 _bpcs_config_path），但 BPCS 自己启动时只按
+    BAIDUPCS_GO_CONFIG_DIR → 系统用户目录的顺序找配置；不强制指向数据目录的话，
+    who/login/logout/download 等子进程会各自读写系统目录里的旧配置，登录态就
+    落到了 AstrBot 数据卷之外，Docker 重建容器即丢失。"""
+    return {**os.environ, "BAIDUPCS_GO_CONFIG_DIR": PLUGIN_DATA_DIR}
+
 def _run_bpcs(args: list, timeout: int = 300) -> tuple:
     try:
         r = subprocess.run(
             [BPCS_PATH] + args, capture_output=True, text=True,
-            timeout=timeout, encoding="utf-8", errors="replace"
+            timeout=timeout, encoding="utf-8", errors="replace",
+            env=_bpcs_env(),
         )
         return r.stdout or "", r.stderr or "", r.returncode
     except subprocess.TimeoutExpired:
@@ -31,7 +42,12 @@ def _run_bpcs(args: list, timeout: int = 300) -> tuple:
         return "", str(e), -2
 
 def _init_bpcs() -> bool:
-    """检查 BaiduPCS-Go 是否已有本地登录凭证（通过 who 命令）。"""
+    """检查本地是否已有可用的登录凭证（直接读数据目录里的 pcs_config.json）。
+
+    此前用 who 命令的输出判断登录态，但 BaiduPCS-Go 的 who 无论是否登录都输出
+    「当前帐号 uid: N, ...」且退出码 0（未登录 N=0），按「输出不含 登录/未登录
+    即已登录」判断永远命中「已登录」，未登录也会打出误导日志。现在改读配置里
+    当前账号的凭证字段，与下载/转存实际使用的判据保持一致。"""
     if state.bpcs_inited:
         return True
     with _bpcs_lock:
@@ -40,40 +56,59 @@ def _init_bpcs() -> bool:
         if not _ensure_bpcs_exe():
             logger.warning(f"[baidu_netdisk] ⚠️ {_BPCS_EXE_NAME} 不可用，登录时会自动尝试下载（管理员也可用 /pan pcs 手动下载）")
             return False
-        out, _, code = _run_bpcs(["who"], timeout=15)
-        if code == 0 and out and "登录" not in (out or "") and "未登录" not in (out or ""):
+        user = _first_bpcs_user(_load_bpcs_config(quiet=True) or {})
+        if user.get("cookies") or user.get("bduss"):
             state.bpcs_inited = True
-            logger.info(f"[baidu_netdisk] BaiduPCS-Go already logged in: {out.strip()[:100]}")
+            logger.info(f"[baidu_netdisk] BaiduPCS-Go logged in: uid={user.get('uid')}, name={user.get('name')}")
             return True
         logger.info("[baidu_netdisk] BaiduPCS-Go not logged in, use /pan login")
         return False
 
-def _bpcs_config_path() -> str:
-    """BaiduPCS-Go 的 pcs_config.json 路径（登录凭证，沿用 BaiduPCS-Go 默认位置）。
+def _legacy_bpcs_config_paths() -> list[str]:
+    """v2.1 及更早版本可能存放 pcs_config.json 的候选位置（一次性迁移用）。
 
-    与 BaiduPCS-Go 源码 GetConfigDir() 保持一致：
-      - BAIDUPCS_GO_CONFIG_DIR 环境变量（绝对路径直接用，相对路径以 exe 所在目录为基准）
-      - exe 同目录已存在旧版 pcs_config.json 时沿用旧位置
-      - Windows: %APPDATA%/BaiduPCS-Go
-      - Linux/macOS: ~/.config/BaiduPCS-Go
-      - 上述都不可用时回退到 exe 同目录"""
+    顺序即优先度：exe 同目录（历史默认）→ BAIDUPCS_GO_CONFIG_DIR 指向的目录
+    （README 曾推荐）→ 系统用户目录（Windows %APPDATA% / Linux macOS ~/.config）。"""
     exe_dir = os.path.dirname(os.path.abspath(BPCS_PATH))
+    paths = [os.path.join(exe_dir, "pcs_config.json")]
     env = os.environ.get("BAIDUPCS_GO_CONFIG_DIR")
     if env:
         base = env if os.path.isabs(env) else os.path.join(exe_dir, env)
-        return os.path.join(base, "pcs_config.json")
-    # 旧版行为：exe 同目录已存在 pcs_config.json 时沿用，避免切换路径后丢登录态
-    if os.path.exists(os.path.join(exe_dir, "pcs_config.json")):
-        return os.path.join(exe_dir, "pcs_config.json")
+        paths.append(os.path.join(base, "pcs_config.json"))
     if _IS_WINDOWS:
         appdata = os.environ.get("APPDATA")
         if appdata:
-            return os.path.join(appdata, "BaiduPCS-Go", "pcs_config.json")
-        return os.path.join(exe_dir, "pcs_config.json")  # APPDATA 缺失时落到程序目录
-    home = os.path.expanduser("~")
-    if home and home != "~":
-        return os.path.join(home, ".config", "BaiduPCS-Go", "pcs_config.json")
-    return os.path.join(exe_dir, "pcs_config.json")  # HOME 缺失时落到程序目录
+            paths.append(os.path.join(appdata, "BaiduPCS-Go", "pcs_config.json"))
+    else:
+        home = os.path.expanduser("~")
+        if home and home != "~":
+            paths.append(os.path.join(home, ".config", "BaiduPCS-Go", "pcs_config.json"))
+    return paths
+
+def _bpcs_config_path() -> str:
+    """BaiduPCS-Go 的 pcs_config.json 路径（登录凭证），固定放在插件数据目录。
+
+    历史版本把凭证存到 BPCS 的默认位置（系统用户目录等），不在 AstrBot 的 data
+    卷上，Docker 重建容器就丢登录态。现在统一收进插件数据目录（data/plugin_data/
+    <插件名>/，随 AstrBot 数据卷持久化）；首次运行时若旧位置已有配置，自动原子
+    迁移过来一次，避免升级后要求用户重新登录。
+
+    同时 _bpcs_env() 会给所有 BPCS 子进程注入 BAIDUPCS_GO_CONFIG_DIR 指向本目录，
+    保证子进程（who/login/logout/download）与插件读到的是同一份凭证。"""
+    new_path = os.path.join(PLUGIN_DATA_DIR, "pcs_config.json")
+    if os.path.exists(new_path):
+        return new_path
+    for old in _legacy_bpcs_config_paths():
+        if not os.path.exists(old):
+            continue
+        try:
+            with open(old, "r", encoding="utf-8", errors="replace") as f:
+                _atomic_write(new_path, f.read(), mode=0o600)
+            logger.info(f"[baidu_netdisk] 已把登录凭证从旧位置迁移到插件数据目录: {old} → {new_path}")
+        except OSError as e:
+            logger.warning(f"[baidu_netdisk] ⚠️ 登录凭证迁移失败（{old} → {new_path}）: {e}")
+        return new_path
+    return new_path
 
 def _fetch_uid_by_bduss(bduss: str, stoken: str = "", cookies: str = "") -> tuple[str, str]:
     """查一次网盘账号信息，返回 `(uid, 昵称)`；查不到返回 `("", "")`。
@@ -215,12 +250,12 @@ def _patch_config_stoken(stoken: str, bduss: str = "") -> None:
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = _json.load(f)
-        user_list = cfg.get("baidu_user_list", [])
-        if user_list:
+        user = _first_bpcs_user(cfg)
+        if user:
             if stoken:
-                user_list[0]["stoken"] = stoken
+                user["stoken"] = stoken
             if bduss:
-                user_list[0]["bduss"] = bduss
+                user["bduss"] = bduss
             # 这份配置 BaiduPCS-Go 自己也会读写，保持 indent=4 以免两边来回改格式
             _atomic_write_json(config_path, cfg, indent=4)
             logger.info(f"[baidu_netdisk] patched stoken into config")
@@ -268,6 +303,7 @@ def login_bpcs(username: str, password: str, allow_insecure_tls: bool = False) -
         proc = subprocess.Popen(
             [BPCS_PATH, "login"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=_bpcs_env(),
         )
         out_bytes, _ = proc.communicate(
             input=f"{username}\n{password}\n".encode("utf-8"), timeout=60
@@ -320,10 +356,21 @@ def _load_bpcs_config(quiet: bool = False) -> dict | None:
     return cfg if isinstance(cfg, dict) else None
 
 def _first_bpcs_user(cfg: dict) -> dict:
-    """取 pcs_config.json 里的当前账号记录（无则空 dict）。"""
+    """取 pcs_config.json 里的当前账号记录（无则空 dict）。
+
+    以 baidu_active_uid 为准（与 BaiduPCS-Go 的 ActiveUser 一致），找不到再退回
+    列表第一项（兼容旧配置）。不能只取 users[0]：每次登录都是「去重同 uid 后
+    追加到列表末尾」，先后用两个账号登录后首项是旧账号，API 会话只会用它，
+    而 BPCS 子进程用的是 active 账号，两边就各干各的了。"""
     users = cfg.get("baidu_user_list")
-    if isinstance(users, list) and users and isinstance(users[0], dict):
-        return users[0]
+    if isinstance(users, list):
+        active_uid = cfg.get("baidu_active_uid")
+        for u in users:
+            if isinstance(u, dict) and str(u.get("uid")) == str(active_uid):
+                return u
+        for u in users:
+            if isinstance(u, dict):
+                return u
     return {}
 
 def _apply_baidu_cookies(sess: _req.Session, cookies_str: str) -> None:
